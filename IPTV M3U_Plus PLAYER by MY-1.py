@@ -12,7 +12,7 @@ from lxml import etree, html
 from datetime import datetime
 from dateutil import parser, tz
 import xml.etree.ElementTree as ET
-from PyQt5.QtGui import QIcon, QFont, QImage, QPixmap, QColor, QDesktopServices, QIntValidator
+from PyQt5.QtGui import QIcon, QFont, QImage, QPixmap, QColor, QDesktopServices, QIntValidator, QPalette
 from PyQt5.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QObject, pyqtSignal, 
     QRunnable, pyqtSlot, QThreadPool, QModelIndex, QAbstractItemModel, QVariant, QUrl
@@ -27,11 +27,11 @@ from PyQt5.QtWidgets import (
 )
 
 from AccountManager import AccountManager
-from CustomPyQtWidgets import LiveInfoBox, MovieInfoBox, SeriesInfoBox
+from CustomPyQtWidgets import LiveInfoBox, MovieInfoBox, SeriesInfoBox, EmbeddedPlayerWindow
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher
 
-CURRENT_VERSION = "V1.04.00"
+CURRENT_VERSION = "V2.00.00"
 
 is_windows  = sys.platform.startswith('win')
 is_mac      = sys.platform.startswith('darwin')
@@ -174,9 +174,20 @@ class IPTVPlayerApp(QMainWindow):
         self.movie_url_format  = ""
         self.series_url_format = ""
 
-        #Create threadpool
+        #Create threadpool for data/EPG/image fetching. Single-threaded to keep
+        #fetching ordered and gentle on the IPTV server.
         self.threadpool = QThreadPool()
         self.threadpool.setMaxThreadCount(1)
+
+        #Stream-status probes run on a dedicated 2-thread pool so a slow LIVE channel
+        #check can't block image or EPG fetching (issue #74).
+        self.status_threadpool = QThreadPool()
+        self.status_threadpool.setMaxThreadCount(2)
+
+        #Whether the LIVE traffic-light stream-status check is enabled. The check
+        #can be disabled in the Settings tab if a provider's streams are flaky and
+        #the probe is producing false offline reports.
+        self.stream_status_enabled = True
 
         self.initIcons()
 
@@ -357,33 +368,50 @@ class IPTVPlayerApp(QMainWindow):
         main_layout.addWidget(self.progress_bar)
 
     def updateUserDataFile(self):
-        # Load the configuration file
+        # Load the configuration file. A corrupted .ini must not crash the app —
+        # fall back to a fresh config so the user can re-add accounts.
         config = configparser.ConfigParser()
-        config.read(self.user_data_file)
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError) as e:
+            print(f"User data file is corrupt, ignoring it: {e}")
+            try:
+                os.rename(self.user_data_file, self.user_data_file + ".bak")
+            except OSError:
+                pass
+            return
 
         # Check if 'Credentials' section exists
-        if 'Credentials' in config:
-            for account_name, data in config['Credentials'].items():
-                parts = data.split('|')
+        if 'Credentials' not in config:
+            return
 
-                # Determine the required length and default values based on the method
-                if data.startswith('manual|'):
-                    required_length = 7
-                elif data.startswith('m3u_plus|'):
-                    required_length = 5
-                else:
-                    continue  # Skip if the method is not recognized
+        for account_name, data in config['Credentials'].items():
+            parts = data.split('|')
 
-                # Update to new format with default values if necessary
-                if len(parts) < required_length:
-                    parts += [self.default_url_formats['live'],
-                              self.default_url_formats['movie'],
-                              self.default_url_formats['series']][:required_length - len(parts)]
-                    config['Credentials'][account_name] = "|".join(parts)
+            # Required total length and which fields are the URL-format tail.
+            if data.startswith('manual|'):
+                required_length = 7  # manual|server|user|pass|live_fmt|movie_fmt|series_fmt+1 leading tag
+            elif data.startswith('m3u_plus|'):
+                required_length = 5  # m3u_plus|url|live_fmt|movie_fmt|series_fmt+1 leading tag
+            else:
+                continue
 
-            # Write the updated configuration back to the file
+            # Append default URL formats for whichever ones are missing at the tail.
+            if len(parts) < required_length:
+                defaults = [self.default_url_formats['live'],
+                            self.default_url_formats['movie'],
+                            self.default_url_formats['series']]
+                missing = required_length - len(parts)
+                # Take the LAST `missing` defaults (the tail of the list), not the first —
+                # the first defaults that exist in `parts` are for live/movie, missing ones are at the end.
+                parts += defaults[-missing:]
+                config['Credentials'][account_name] = "|".join(parts)
+
+        try:
             with open(self.user_data_file, 'w') as config_file:
                 config.write(config_file)
+        except OSError as e:
+            print(f"Could not persist user data file: {e}")
 
     def initIcons(self):
         #Set tab icon size to 24x24
@@ -517,6 +545,38 @@ class IPTVPlayerApp(QMainWindow):
 
         #Get list
         list_widget = list_widgets[stream_type]
+
+        # The Seasons view (Series tab, navigation level 1) needs numeric ordering, not Qt's
+        # default text sort — otherwise "Season 10" comes before "Season 2". Issue #18.
+        is_seasons_view = (
+            list_content_type == 'streaming'
+            and stream_type == 'Series'
+            and getattr(self, 'series_navigation_level', 0) == 1
+        )
+        if is_seasons_view and sorting_enabled:
+            seasons_dict = self.currently_loaded_streams.get('Seasons', {}) or {}
+
+            def _season_sort_key(k):
+                try:
+                    return (0, int(k))
+                except (TypeError, ValueError):
+                    return (1, str(k).lower())
+
+            keys = sorted(seasons_dict.keys(), key=_season_sort_key)
+            if sort_order == 1:
+                keys.reverse()
+
+            list_widget.setSortingEnabled(False)
+            list_widget.clear()
+            go_back_item = QListWidgetItem(self.go_back_text)
+            go_back_item.setIcon(self.go_back_icon)
+            list_widget.addItem(go_back_item)
+            for season in keys:
+                item = QListWidgetItem(f"Season {season}")
+                item.setData(Qt.UserRole, seasons_dict[season])
+                list_widget.addItem(item)
+            self.animate_progress(0, 100, f"Finished sorting {stream_type} {list_content_type}")
+            return
 
         #Enable or disable sorting
         list_widget.setSortingEnabled(sorting_enabled)
@@ -685,9 +745,9 @@ class IPTVPlayerApp(QMainWindow):
         self.series_history_lbl = QLabel("Previously watched series")
 
         #Set fonts
-        self.live_history_lbl.setFont(QFont('Arial', 14, QFont.Bold))
-        self.movie_history_lbl.setFont(QFont('Arial', 14, QFont.Bold))
-        self.series_history_lbl.setFont(QFont('Arial', 14, QFont.Bold))
+        self.live_history_lbl.setFont(QFont('Segoe UI', 14, QFont.Bold))
+        self.movie_history_lbl.setFont(QFont('Segoe UI', 14, QFont.Bold))
+        self.series_history_lbl.setFont(QFont('Segoe UI', 14, QFont.Bold))
 
         #Add widgets to home tab
         self.home_tab_layout.addWidget(self.live_history_lbl)
@@ -806,6 +866,17 @@ class IPTVPlayerApp(QMainWindow):
         self.choose_player_button.setToolTip("Set the Media Player used for watching content, use e.g. VLC or SMPlayer")
         self.choose_player_button.clicked.connect(self.choose_external_player)
 
+        self.use_embedded_player_button = QPushButton("Use Internal Player (VLC)")
+        self.use_embedded_player_button.setIcon(self.mediaplayer_icon)
+        self.use_embedded_player_button.setToolTip(
+            "Play streams inside this window using the built-in libvlc backend.\n"
+            "Requires VLC to be installed on this machine — download from videolan.org."
+        )
+        self.use_embedded_player_button.clicked.connect(self.use_embedded_player)
+
+        self.current_player_label = QLabel("")
+        self.current_player_label.setStyleSheet("color: #5b8def;")
+
         self.vods_enabled_checkbox = QCheckBox("VODs enabled")
         self.vods_enabled_checkbox.setToolTip("Load the Movies/Series tabs for the IPTV account")
         self.vods_enabled_checkbox.stateChanged.connect(self.toggleVODs)
@@ -837,6 +908,18 @@ class IPTVPlayerApp(QMainWindow):
         self.auto_update_checkbox.setToolTip("Automatically check for updates at startup")
         self.auto_update_checkbox.stateChanged.connect(self.toggleAutoUpdate)
 
+        self.stream_status_checkbox = QCheckBox("Show LIVE stream status indicator")
+        self.stream_status_checkbox.setToolTip(
+            "Show the green/red traffic light next to a LIVE channel.\n"
+            "Disable if your provider's stream status probes are flaky or slow."
+        )
+        self.stream_status_checkbox.stateChanged.connect(self.toggleStreamStatus)
+
+        self.theme_select_box = QComboBox()
+        self.theme_select_box.addItems(["System", "Light", "Dark"])
+        self.theme_select_box.setToolTip("Switch between Light, Dark, or follow the OS setting (default).")
+        self.theme_select_box.currentTextChanged.connect(self.themeChanged)
+
         #Set timeout integer validator
         timeout_validator = QIntValidator(0, 999)
 
@@ -858,12 +941,17 @@ class IPTVPlayerApp(QMainWindow):
         #Add widgets to settings tab layout
         self.settings_layout.addWidget(self.address_book_button,                            0, 0)
         self.settings_layout.addWidget(self.choose_player_button,                           0, 1)
+        self.settings_layout.addWidget(self.use_embedded_player_button,                     0, 2)
+        self.settings_layout.addWidget(self.current_player_label,                          10, 0, 1, 3)
         self.settings_layout.addWidget(self.vods_enabled_checkbox,                          1, 0)
         self.settings_layout.addWidget(self.keep_on_top_checkbox,                           2, 0)
         self.settings_layout.addWidget(QLabel("Default sorting order: "),                   3, 0)
         self.settings_layout.addWidget(self.default_sorting_order_box,                      3, 1)
         self.settings_layout.addWidget(self.update_checker,                                 4, 0)
         self.settings_layout.addWidget(self.auto_update_checkbox,                           4, 1)
+        self.settings_layout.addWidget(self.stream_status_checkbox,                         9, 0)
+        self.settings_layout.addWidget(QLabel("Theme: "),                                  11, 0)
+        self.settings_layout.addWidget(self.theme_select_box,                              11, 1)
 
         #Advanced options
         self.settings_layout.addWidget(QLabel("Select User-Agent (Advanced option): "),         5, 0)
@@ -897,10 +985,13 @@ class IPTVPlayerApp(QMainWindow):
     def loadDefaultUserAgent(self):
         #Read userdata config file
         config = configparser.ConfigParser()
-        config.read(self.user_data_file)
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
 
         #Check if defined in config. Otherwise set to default
-        if 'User-Agent' in config:
+        if config.has_option('User-Agent', 'user-agent'):
             self.current_user_agent = config['User-Agent']['user-agent']
         else:
             self.current_user_agent = Threadpools.DEFAULT_USER_AGENT_HEADER
@@ -911,10 +1002,13 @@ class IPTVPlayerApp(QMainWindow):
     def loadDefaultVODs(self):
         #Read userdata config file
         config = configparser.ConfigParser()
-        config.read(self.user_data_file)
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
 
         #Check if defined in config. Otherwise set to default
-        if 'VOD' in config:
+        if config.has_option('VOD', 'enabled'):
             self.vods_enabled = (config['VOD']['enabled'] == 'True')
         else:
             self.vods_enabled = True
@@ -1009,6 +1103,11 @@ class IPTVPlayerApp(QMainWindow):
         except Exception as e:
             print(f"Failed loading default timeout values: {e}")
 
+    def _version_tuple(self, v):
+        # "V1.03.02" -> (1, 3, 2). Used so the update checker doesn't prompt when
+        # the current build is AHEAD of upstream (e.g. an unreleased fork build).
+        return tuple(int(x) for x in re.findall(r'\d+', v or ""))
+
     def checkForUpdates(self, enable_update_msg):
         try:
             print("Checking for updates")
@@ -1016,15 +1115,19 @@ class IPTVPlayerApp(QMainWindow):
             #Create github api url to fetch data from
             git_api_url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
-            #Request data from url
-            git_resp = requests.get(git_api_url, timeout=Threadpools.CONNECTION_TIMEOUT)
+            #Request data from url. Pair a small read-timeout with the connection timeout —
+            #without one a slow GitHub response can block the main thread indefinitely
+            #(the previous code only set the connection timeout).
+            git_resp = requests.get(git_api_url, timeout=(Threadpools.CONNECTION_TIMEOUT, 5))
 
             #Get data and latest version
             data = git_resp.json()
             latest_version = data['tag_name']
 
-            #Check if current version is up to date
-            if latest_version != CURRENT_VERSION:
+            #Only prompt when upstream is strictly newer than what we're running —
+            #avoids a spurious "update available" dialog for fork/dev builds that
+            #carry a higher version number.
+            if self._version_tuple(latest_version) > self._version_tuple(CURRENT_VERSION):
                 #If not up to date ask if user wants to go to download page
                 reply = QMessageBox.question(self, 'Update Available',
                                              f"A new version ({latest_version}) is available.\n"
@@ -1066,10 +1169,13 @@ class IPTVPlayerApp(QMainWindow):
     def loadDefaultAutoUpdate(self):
         #Read userdata file
         config = configparser.ConfigParser()
-        config.read(self.user_data_file)
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
 
         #Check if updater is in config
-        if 'Updater' in config:
+        if config.has_option('Updater', 'auto-update-checker'):
             if config['Updater']['auto-update-checker'] == 'True':
                 #Set checkbox checked
                 self.auto_update_checkbox.setCheckState(Qt.Checked)
@@ -1082,8 +1188,11 @@ class IPTVPlayerApp(QMainWindow):
             #Write default value to userdata file
             config['Updater'] = {'auto-update-checker': True}
 
-            with open(self.user_data_file, 'w') as config_file:
-                config.write(config_file)
+            try:
+                with open(self.user_data_file, 'w') as config_file:
+                    config.write(config_file)
+            except OSError as e:
+                print(f"Could not write user data file: {e}")
 
             #Set checkbox checked
             self.auto_update_checkbox.setCheckState(Qt.Checked)
@@ -1108,6 +1217,7 @@ class IPTVPlayerApp(QMainWindow):
     def loadDataAtStartup(self):
         #Load external media player
         self.external_player_command = self.load_external_player_command()
+        self._refresh_current_player_label()
 
         #Load default sorting setting
         self.loadDefaultSortingOrder()
@@ -1121,6 +1231,12 @@ class IPTVPlayerApp(QMainWindow):
         #Load default auto update checker
         self.loadDefaultAutoUpdate()
 
+        #Load stream-status toggle (issue #74)
+        self.loadDefaultStreamStatus()
+
+        #Apply persisted theme (Light / Dark / System) — default System
+        self.loadDefaultTheme()
+
         #Load startup credentials
         self.loadStartupCredentials()
 
@@ -1128,42 +1244,54 @@ class IPTVPlayerApp(QMainWindow):
         self.loadDefaultTimeout()
 
     def loadStartupCredentials(self):
-        # Load playlist on startup if enabled
+        # Load playlist on startup if enabled. A malformed/missing key here used to crash
+        # the app right after the login screen (issue #92), so every access is guarded.
         config = configparser.ConfigParser()
-        config.read(self.user_data_file)
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError) as e:
+            print(f"Failed reading user data file at startup: {e}")
+            return
 
-        #If startup credentials is in user data file
-        if 'Startup credentials' in config:
-            #Get selected account used for startup
-            selected_startup_account = config['Startup credentials']['startup_credentials']
+        if 'Startup credentials' not in config:
+            return
 
-            #Check if account credentials are in user data file
-            if 'Credentials' in config and selected_startup_account in config['Credentials']:
-                data = config['Credentials'][selected_startup_account]
-                parts = data.split('|')
+        selected_startup_account = config['Startup credentials'].get('startup_credentials', '')
+        if not selected_startup_account or selected_startup_account == 'None':
+            return
 
-                if data.startswith('manual|'):
-                    server, username, password, live_url_format, movie_url_format, series_url_format = parts[1:7]
+        if 'Credentials' not in config or selected_startup_account not in config['Credentials']:
+            return
 
-                    self.server            = server
-                    self.username          = username
-                    self.password          = password
-                    self.live_url_format   = live_url_format
-                    self.movie_url_format  = movie_url_format
-                    self.series_url_format = series_url_format
+        try:
+            data = config['Credentials'][selected_startup_account]
+            parts = data.split('|')
 
+            if data.startswith('manual|') and len(parts) >= 7:
+                server, username, password, live_url_format, movie_url_format, series_url_format = parts[1:7]
+
+                self.server            = server
+                self.username          = username
+                self.password          = password
+                self.live_url_format   = live_url_format
+                self.movie_url_format  = movie_url_format
+                self.series_url_format = series_url_format
+
+                self.login()
+
+            elif data.startswith('m3u_plus|') and len(parts) >= 5:
+                m3u_url, live_url_format, movie_url_format, series_url_format = parts[1:5]
+
+                self.live_url_format   = live_url_format
+                self.movie_url_format  = movie_url_format
+                self.series_url_format = series_url_format
+
+                if self.extract_credentials_from_m3u_plus_url(m3u_url):
                     self.login()
-
-                elif data.startswith('m3u_plus|'):
-                    m3u_url, live_url_format, movie_url_format, series_url_format = parts[1:5]
-
-                    self.live_url_format   = live_url_format
-                    self.movie_url_format  = movie_url_format
-                    self.series_url_format = series_url_format
-
-                    #Get credentials from M3U plus url and check if valid
-                    if self.extract_credentials_from_m3u_plus_url(m3u_url):
-                        self.login()
+            else:
+                print(f"Skipping startup account '{selected_startup_account}': data is malformed.")
+        except Exception as e:
+            print(f"Failed loading startup account: {e}")
 
     def toggleKeepOnTop(self, state):
         if state == Qt.Checked:
@@ -1171,6 +1299,127 @@ class IPTVPlayerApp(QMainWindow):
         else:
             self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
         self.show()
+
+    def _is_system_dark(self):
+        # On Windows 10/11, AppsUseLightTheme=0 means dark, 1 means light.
+        # Other OSes: fall back to checking the current palette's window-bg luminance.
+        if is_windows:
+            try:
+                import winreg
+                with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                ) as key:
+                    value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                    return value == 0
+            except OSError:
+                return False
+        try:
+            app = QtWidgets.qApp
+            bg = app.palette().color(QPalette.Window)
+            # Rough perceived-luminance check.
+            return (0.299 * bg.red() + 0.587 * bg.green() + 0.114 * bg.blue()) < 128
+        except Exception:
+            return False
+
+    def _apply_theme(self, theme_name):
+        # Theme names: "System", "Light", "Dark". Anything else falls back to System.
+        app = QtWidgets.qApp
+        if theme_name == "Dark" or (theme_name == "System" and self._is_system_dark()):
+            palette = QPalette()
+            palette.setColor(QPalette.Window,          QColor(45, 45, 48))
+            palette.setColor(QPalette.WindowText,      Qt.white)
+            palette.setColor(QPalette.Base,            QColor(30, 30, 30))
+            palette.setColor(QPalette.AlternateBase,   QColor(45, 45, 48))
+            palette.setColor(QPalette.ToolTipBase,     QColor(45, 45, 48))
+            palette.setColor(QPalette.ToolTipText,     Qt.white)
+            palette.setColor(QPalette.Text,            Qt.white)
+            palette.setColor(QPalette.Button,          QColor(45, 45, 48))
+            palette.setColor(QPalette.ButtonText,      Qt.white)
+            palette.setColor(QPalette.BrightText,      Qt.red)
+            palette.setColor(QPalette.Link,            QColor(91, 141, 239))
+            palette.setColor(QPalette.Highlight,       QColor(91, 141, 239))
+            palette.setColor(QPalette.HighlightedText, Qt.black)
+            palette.setColor(QPalette.Disabled, QPalette.Text,       QColor(127, 127, 127))
+            palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(127, 127, 127))
+            app.setPalette(palette)
+        else:
+            # Fusion's built-in light palette.
+            app.setPalette(app.style().standardPalette())
+
+    def themeChanged(self, theme_name):
+        self._apply_theme(theme_name)
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+        config['Theme'] = {'mode': theme_name}
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+        except OSError as e:
+            print(f"Could not write user data file: {e}")
+
+    def loadDefaultTheme(self):
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+        mode = "System"
+        if config.has_option("Theme", "mode"):
+            mode = config["Theme"]["mode"]
+            if mode not in ("System", "Light", "Dark"):
+                mode = "System"
+        # Block signals so applying the value to the combobox doesn't re-trigger
+        # a write to disk.
+        self.theme_select_box.blockSignals(True)
+        self.theme_select_box.setCurrentText(mode)
+        self.theme_select_box.blockSignals(False)
+        self._apply_theme(mode)
+
+    def toggleStreamStatus(self, state):
+        checked = bool(state)
+        self.stream_status_enabled = checked
+
+        # Reset the indicator to "unknown" when disabling so the UI doesn't keep a
+        # stale green/red dot from the previous probe.
+        if not checked:
+            try:
+                self.live_info_box.stream_status.setPixmap(
+                    QPixmap(self.path_to_unknown_status_icon).scaledToWidth(24)
+                )
+            except Exception:
+                pass
+
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+        config['StreamStatus'] = {'enabled': str(checked)}
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+        except OSError as e:
+            print(f"Could not write user data file: {e}")
+
+    def loadDefaultStreamStatus(self):
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+
+        if config.has_option('StreamStatus', 'enabled'):
+            self.stream_status_enabled = (config['StreamStatus']['enabled'] == 'True')
+        else:
+            self.stream_status_enabled = True
+
+        self.stream_status_checkbox.setCheckState(
+            Qt.Checked if self.stream_status_enabled else Qt.Unchecked
+        )
 
     def toggleVODs(self, state):
         checked = bool(state)
@@ -1212,28 +1461,59 @@ class IPTVPlayerApp(QMainWindow):
         self.iptv_info_text.setFont(font)
 
     def extract_credentials_from_m3u_plus_url(self, url):
+        # Parses an Xtream get.php URL into (server, username, password). The previous
+        # regex required `&type=m3u_plus` to appear in exactly that position and contained
+        # a literal `&output=m3u8` as a "type" alternative — which was a bug. We now use
+        # urllib.parse so the query parameters can appear in any order, and we follow
+        # shortened-URL redirects (bit.ly etc.) before parsing (see issues #2 and #13).
+        from urllib.parse import urlparse, parse_qs
+
+        def _show_invalid():
+            self.animate_progress(0, 100, "Invalid m3u_plus or m3u URL")
+            dlg = QMessageBox(self)
+            dlg.setWindowTitle("Error!")
+            dlg.setText("M3U plus URL is invalid!\nPlease enter a valid Xtream get.php URL.")
+            dlg.exec()
+
+        def _parse(candidate_url):
+            parsed = urlparse(candidate_url)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                return None
+            # Accept any path that ends with /get.php — some providers use a prefix path.
+            if not parsed.path.endswith('/get.php'):
+                return None
+            qs = parse_qs(parsed.query)
+            username = (qs.get('username') or [None])[0]
+            password = (qs.get('password') or [None])[0]
+            if not username or not password:
+                return None
+            # Build the server origin from the parsed URL (preserves port if present).
+            server = f"{parsed.scheme}://{parsed.netloc}"
+            return server, username, password
+
         try:
-            pattern = r'(http[s]?://[^/]+)/get\.php\?username=([^&]*)&password=([^&]*)&type=(m3u_plus|m3u|&output=m3u8)'
-            match = re.match(pattern, url)
-            if match:
-                self.server     = match.group(1)
-                self.username   = match.group(2)
-                self.password   = match.group(3)
+            result = _parse(url)
 
+            # If it doesn't parse directly, the user may have pasted a shortened URL.
+            # Follow redirects once (HEAD with a small timeout) and try the resolved URL.
+            if result is None and url.lower().startswith(('http://', 'https://')):
+                try:
+                    resp = requests.head(url, allow_redirects=True, timeout=5)
+                    if resp.url and resp.url != url:
+                        print(f"Resolved shortened URL: {url} -> {resp.url}")
+                        result = _parse(resp.url)
+                except requests.RequestException as e:
+                    print(f"Could not resolve URL '{url}': {e}")
+
+            if result:
+                self.server, self.username, self.password = result
                 return True
-            else:
-                self.animate_progress(0, 100, "Invalid m3u_plus or m3u URL")
 
-                dlg = QMessageBox(self)
-                dlg.setWindowTitle("Error!")
-                dlg.setText("M3U plus URL is invalid!\nPlease enter valid URL")
-                dlg.exec()
-
-                return False
+            _show_invalid()
+            return False
         except Exception as e:
             print(f"Error extracting credentials: {e}")
             self.animate_progress(0, 100, "Error extracting credentials")
-
             return False
 
     def set_progress_text(self, text):
@@ -1454,14 +1734,14 @@ class IPTVPlayerApp(QMainWindow):
 
         #Set movie info box texts
         self.movies_info_box.name.setText(f"{movie_name}")
-        self.movies_info_box.release_date.setText(f"Release date: {vod_info.get('releasedate', '??-??-????')}")
-        self.movies_info_box.country.setText(f"Country: {vod_info.get('country', '?')}")
-        self.movies_info_box.genre.setText(f"Genre: {vod_info.get('genre', '?')}")
-        self.movies_info_box.duration.setText(f"Duration: {vod_info.get('duration', '??:??:??')}")
-        self.movies_info_box.rating.setText(f"Rating: {vod_info.get('rating', '?')}")
-        self.movies_info_box.director.setText(f"Director: {vod_info.get('director', 'director: ?')}")
-        self.movies_info_box.cast.setText(f"Cast: {vod_info.get('actors', 'actors: ?')}")
-        self.movies_info_box.description.setText(f"Description: {vod_info.get('description', '?')}")
+        self.movies_info_box.release_date.setText(f"Release date: {vod_info.get('releasedate') or '—'}")
+        self.movies_info_box.country.setText(f"Country: {vod_info.get('country') or '—'}")
+        self.movies_info_box.genre.setText(f"Genre: {vod_info.get('genre') or '—'}")
+        self.movies_info_box.duration.setText(f"Duration: {vod_info.get('duration') or '—'}")
+        self.movies_info_box.rating.setText(f"Rating: {vod_info.get('rating') or '—'}")
+        self.movies_info_box.director.setText(f"Director: {vod_info.get('director') or '—'}")
+        self.movies_info_box.cast.setText(f"Cast: {vod_info.get('actors') or '—'}")
+        self.movies_info_box.description.setText(f"Description: {vod_info.get('description') or '—'}")
 
         #Get youtube trailer code
         yt_code = vod_info.get('youtube_trailer', 0)
@@ -1521,13 +1801,20 @@ class IPTVPlayerApp(QMainWindow):
             go_back_item.setIcon(self.go_back_icon)
             self.streaming_list_widgets['Series'].addItem(go_back_item)
 
-            #Save currently loaded series data for search funcitonality
+            #Save currently loaded series data for search functionality
             self.currently_loaded_streams['Seasons'] = series_info_data['episodes']
 
-            #Go through each season in the series info data.
-            #Note that 'episodes' is called, as this is the name given in the data. 
-            #When you look at the data you can see these are actually seasons.
-            for season in series_info_data['episodes'].keys():
+            # Sort season keys numerically when possible — Qt's default text sort
+            # would put "Season 10" before "Season 2" (issue #18). The provider
+            # returns string keys, so we cast to int when the key is numeric and
+            # otherwise fall back to a lexical order at the end of the list.
+            def _season_sort_key(k):
+                try:
+                    return (0, int(k))
+                except (TypeError, ValueError):
+                    return (1, str(k).lower())
+
+            for season in sorted(series_info_data['episodes'].keys(), key=_season_sort_key):
                 #Create season item
                 item = QListWidgetItem(f"Season {season}")
 
@@ -1557,30 +1844,34 @@ class IPTVPlayerApp(QMainWindow):
                 #If series name is empty set replacement
                 series_name = 'No name Available...'
 
-            seasons = ""
-            for key in series_info_data['episodes'].keys():
-                # print(f"season: {key}")
-                seasons += f"{key}, "
+            # Build the seasons list naturally — `", ".join(...)` avoids the trailing
+            # comma the previous code left behind ("Seasons: 1," → "Seasons: 1").
+            season_keys = [str(k) for k in series_info_data['episodes'].keys()]
+            seasons = ", ".join(season_keys) if season_keys else "—"
 
             #Get strings from series info
-            release_date    = series_info.get('releaseDate', '????-??-??')
-            genre           = series_info.get('genre', '?')
-            duration        = series_info.get('episode_run_time', '?')
-            rating          = series_info.get('rating', '?')
-            director        = series_info.get('director', '?')
-            cast            = series_info.get('cast', '?')
-            plot            = series_info.get('plot', '?')
+            release_date    = series_info.get('releaseDate')   or "—"
+            genre           = series_info.get('genre')         or "—"
+            duration        = series_info.get('episode_run_time')
+            rating          = series_info.get('rating')
+            director        = series_info.get('director')      or "—"
+            cast            = series_info.get('cast')          or "—"
+            plot            = series_info.get('plot')          or "—"
 
             #Set series info box texts
             self.series_info_box.name.setText(f"{series_name}")
-            self.series_info_box.release_date.setText(f"Release date: {release_date if release_date else '????-??-??'}")
-            self.series_info_box.genre.setText(f"Genre: {genre if genre else '?'}")
+            self.series_info_box.release_date.setText(f"Release date: {release_date}")
+            self.series_info_box.genre.setText(f"Genre: {genre}")
             self.series_info_box.num_seasons.setText(f"Seasons: {seasons}")
-            self.series_info_box.duration.setText(f"Episode duration: {duration if (duration and duration != '0') else '?'} min")
-            self.series_info_box.rating.setText(f"Rating: {rating if (rating and rating != '0') else '?'}")
-            self.series_info_box.director.setText(f"Director: {director if director else '?'}")
-            self.series_info_box.cast.setText(f"Cast: {cast if cast else '?'}")
-            self.series_info_box.description.setText(f"Description: {plot if plot else '?'}")
+            self.series_info_box.duration.setText(
+                f"Episode duration: {duration if (duration and str(duration) != '0') else '—'} min"
+            )
+            self.series_info_box.rating.setText(
+                f"Rating: {rating if (rating and str(rating) != '0') else '—'}"
+            )
+            self.series_info_box.director.setText(f"Director: {director}")
+            self.series_info_box.cast.setText(f"Cast: {cast}")
+            self.series_info_box.description.setText(f"Description: {plot}")
 
             #Get youtube trailer code
             yt_code = series_info.get('youtube_trailer', 0)
@@ -1687,30 +1978,28 @@ class IPTVPlayerApp(QMainWindow):
 
             fav_data = {}
 
-            #Read favorites data file
-            # fav_file_path = path.join(path.dirname(path.abspath(__file__)), self.favorites_file)
-            # fav_file_path = path.join(path.dirname(path.abspath(__file__)), "favorites.json")
-
-            #Check if cache file exists
             if path.isfile(self.favorites_file):
-                print("favorite file found")
-                # with open(self.favorites_file, 'r') as fav_file:
-                with open(self.favorites_file, 'r') as fav_file:
-                    fav_data = json.load(fav_file)
+                try:
+                    with open(self.favorites_file, 'r') as fav_file:
+                        fav_data = json.load(fav_file)
+                except (OSError, ValueError) as e:
+                    print(f"Could not read favorites file, starting fresh: {e}")
+                    fav_data = {}
+
+            fav_key = 'series_ids' if stream_type == "Series" else 'stream_ids'
+            ids = fav_data.get(fav_key) or []
 
             if is_fav:
-                #Check if stream ids exists in file
-                if fav_data.get('stream_ids' if not (stream_type == "Series") else 'series_ids', 0):
-                    fav_data['stream_ids' if not (stream_type == "Series") else 'series_ids'].append(stream_id)
-                else:
-                    # fav_data = {'stream_ids':[123]}
-                    fav_data['stream_ids' if not (stream_type == "Series") else 'series_ids'] = [stream_id]
+                # Remove first to avoid duplicates if the entry was already in the list,
+                # then append so the freshly-marked item sits at the end of the order
+                # (issue #17 — preserve add-order in the Favorites view).
+                ids = [i for i in ids if i != stream_id]
+                ids.append(stream_id)
             else:
-                #Check if stream ids exists in file
-                if fav_data.get('stream_ids' if not (stream_type == "Series") else 'series_ids', 0):
-                    fav_data['stream_ids' if not (stream_type == "Series") else 'series_ids'].remove(stream_id)
+                ids = [i for i in ids if i != stream_id]
 
-            # with open(self.favorites_file, 'w') as fav_file:
+            fav_data[fav_key] = ids
+
             with open(self.favorites_file, 'w') as fav_file:
                 json.dump(fav_data, fav_file, indent=4)
 
@@ -1718,6 +2007,33 @@ class IPTVPlayerApp(QMainWindow):
             self.animate_progress(0, 100, "Failed adding to favorites")
 
             print(f"Failed adding to favorites: {e}")
+
+    def _favorites_in_user_order(self, stream_type):
+        # Returns the entries in `entries_per_stream_type[stream_type]` whose ids appear
+        # in favorites.json, ordered by their position in that file (i.e. by the order
+        # in which the user marked them). Falls back to catalog order if the file is
+        # missing/corrupt — see issue #17.
+        entries = self.entries_per_stream_type.get(stream_type, []) or []
+        id_field = 'series_id' if stream_type == 'Series' else 'stream_id'
+        fav_key  = 'series_ids' if stream_type == 'Series' else 'stream_ids'
+
+        fav_data = {}
+        if path.isfile(self.favorites_file):
+            try:
+                with open(self.favorites_file, 'r') as fav_file:
+                    fav_data = json.load(fav_file)
+            except (OSError, ValueError) as e:
+                print(f"Could not read favorites file: {e}")
+
+        ordered_ids = fav_data.get(fav_key, []) or []
+        if not ordered_ids:
+            # No favorites file order to follow — fall back to catalog scan, in catalog order.
+            return [e for e in entries if e.get('favorite')]
+
+        # Build a fast lookup, then return entries in favorites.json order, skipping
+        # any ids that no longer exist in the catalog (e.g. removed by the provider).
+        by_id = {e.get(id_field): e for e in entries}
+        return [by_id[i] for i in ordered_ids if i in by_id]
 
     def category_item_clicked(self, clicked_item):
         try:
@@ -1762,30 +2078,33 @@ class IPTVPlayerApp(QMainWindow):
             #Reset scrollbar position to top
             self.streaming_list_widgets[stream_type].scrollToTop()
 
-            for entry in self.entries_per_stream_type[stream_type]:
-                # print(entry)
-                if selected_item_text == self.all_categories_text:
+            is_favorites_view = (selected_item_text == self.fav_categories_text)
+
+            # For the Favorites view, walk the favorites.json id list so items
+            # appear in the order the user marked them — not alphabetically and not
+            # in the order the provider returned the catalog (issue #17).
+            if is_favorites_view:
+                ordered_entries = self._favorites_in_user_order(stream_type)
+                for entry in ordered_entries:
                     item = QListWidgetItem(entry['name'])
                     item.setData(Qt.UserRole, entry)
-
                     self.currently_loaded_streams[stream_type].append(entry)
                     self.streaming_list_widgets[stream_type].addItem(item)
-
-                elif selected_item_text == self.fav_categories_text:
-                    #Check if item is favorite
-                    if entry['favorite'] == True:
+            else:
+                for entry in self.entries_per_stream_type[stream_type]:
+                    if selected_item_text == self.all_categories_text:
                         item = QListWidgetItem(entry['name'])
                         item.setData(Qt.UserRole, entry)
 
                         self.currently_loaded_streams[stream_type].append(entry)
                         self.streaming_list_widgets[stream_type].addItem(item)
 
-                elif entry['category_id'] == category_id:
-                    item = QListWidgetItem(entry['name'])
-                    item.setData(Qt.UserRole, entry)
+                    elif entry.get('category_id') == category_id:
+                        item = QListWidgetItem(entry['name'])
+                        item.setData(Qt.UserRole, entry)
 
-                    self.currently_loaded_streams[stream_type].append(entry)
-                    self.streaming_list_widgets[stream_type].addItem(item)
+                        self.currently_loaded_streams[stream_type].append(entry)
+                        self.streaming_list_widgets[stream_type].addItem(item)
 
             #Check if list is empty after process
             if self.streaming_list_widgets[stream_type].count() == 0:
@@ -1793,8 +2112,9 @@ class IPTVPlayerApp(QMainWindow):
                 item = QListWidgetItem("No items in list...")
 
                 self.streaming_list_widgets[stream_type].addItem(item)
-            else:
-                #Sort list
+            elif not is_favorites_view:
+                #Sort list — but never re-sort the Favorites list, since that would
+                #destroy the user's add-order (issue #17).
                 self.sortList(self.streaming_search_bars[stream_type], 'streaming', stream_type, self.streaming_list_widgets, self.sorting_enabled, self.sorting_order)
 
             self.animate_progress(0, 100, "Loading finished")
@@ -1803,11 +2123,15 @@ class IPTVPlayerApp(QMainWindow):
             print(f"Failed: {e}")
 
     def startOnlineWorker(self, stream_id, url):
-        #Create Stream Status thread worker that will determine if stream looks online or not
+        # Bail out early if the user disabled the traffic-light check.
+        if not getattr(self, 'stream_status_enabled', True):
+            return
+
+        # Run the stream-status probe on the dedicated pool — see issue #74.
         online_worker = OnlineWorker(stream_id, url, self)
         online_worker.signals.finished.connect(self.ProcessStreamStatus)
         online_worker.signals.error.connect(self.onProcessStreamStatusError)
-        self.threadpool.start(online_worker)
+        self.status_threadpool.start(online_worker)
 
     def onProcessStreamStatusError(self, error_msg):
         print(f"Failed processing streaming status: {error_msg}")
@@ -1847,7 +2171,7 @@ class IPTVPlayerApp(QMainWindow):
         self.set_progress_bar(100, "Failed loading EPG data")
 
         #Set list view
-        item = QTreeWidgetItem(["??-??-????", "??:??", "??:??", "Failed loading EPG data..."])
+        item = QTreeWidgetItem(["--/--/----", "--:--", "--:--", "Failed loading EPG data..."])
         self.live_info_box.live_EPG_info.addTopLevelItem(item)
 
     def ProcessEPGData(self, epg_data):
@@ -1860,7 +2184,7 @@ class IPTVPlayerApp(QMainWindow):
 
             #Check if EPG data is empty
             if not epg_data:
-                item = QTreeWidgetItem(["??-??-????", "??:??", "??:??", "No EPG Data Available..."])
+                item = QTreeWidgetItem(["--/--/----", "--:--", "--:--", "No EPG Data Available..."])
 
                 self.live_info_box.live_EPG_info.addTopLevelItem(item)
 
@@ -2135,7 +2459,14 @@ class IPTVPlayerApp(QMainWindow):
             go_back_item.setIcon(self.go_back_icon)
             self.streaming_list_widgets['Series'].addItem(go_back_item)
 
-            for season in self.currently_loaded_streams['Seasons'].keys():
+            # Same natural ordering as the initial season list (issue #18).
+            def _season_sort_key(k):
+                try:
+                    return (0, int(k))
+                except (TypeError, ValueError):
+                    return (1, str(k).lower())
+
+            for season in sorted(self.currently_loaded_streams['Seasons'].keys(), key=_season_sort_key):
                 item = QListWidgetItem(f"Season {season}")
                 item.setData(Qt.UserRole, self.currently_loaded_streams['Seasons'][season])
 
@@ -2228,42 +2559,82 @@ class IPTVPlayerApp(QMainWindow):
                 print(f"Going to play: {url}")
                 self.animate_progress(0, 100, "Loading player for streaming")
 
+                # Embedded VLC marker — short-circuit before constructing any subprocess
+                # command. The marker is set when the user picks "Embedded VLC" in
+                # Settings (so we don't store a real path that could be invoked by accident).
+                if self.external_player_command == "<embedded-vlc>":
+                    self._play_embedded(url)
+                    return
+
+                ua = (self.current_user_agent or "").strip()
+                exe_lower = self.external_player_command.lower()
+
                 if is_linux:
                     #Ensure the external player command is executable
                     if not os.access(self.external_player_command, os.X_OK):
                         self.animate_progress(0, 100, "Selected player is not executable")
                         return
 
-                    #Default support, run without user agent argument
-                    player_cmd = f"{self.external_player_command} \"{url}\""
+                    # Linux: list-form Popen is safe (no shell quirks); each player
+                    # parses its own argv cleanly.
+                    player_cmd = [self.external_player_command]
+                    if exe_lower.endswith("vlc") and ua:
+                        player_cmd.append(f"--http-user-agent={ua}")
+                    elif exe_lower.endswith(("mpv", "mpv.com")) and ua:
+                        player_cmd.append(f"--user-agent={ua}")
+                    player_cmd.append(url)
+                    subprocess.Popen(player_cmd)
 
-                    subprocess.Popen(player_cmd, shell=True)
-                
-                if is_windows:
-                    #Support PotPlayer with the proper command line
-                    if "PotPlayerMini64.exe" in self.external_player_command:
-                        user_agent_argument = f"/user_agent=\"{self.current_user_agent}\""
-                        player_cmd = f"{self.external_player_command} \"{url}\" {user_agent_argument}"
-                    
-                    #Support MPV with the proper command line
-                    elif ("mpv.exe" in self.external_player_command) or ("mpv.com" in self.external_player_command):
-                        user_agent_argument = f"--user-agent=\"{self.current_user_agent}\""
-                        player_cmd = f"{self.external_player_command} {user_agent_argument} \"{url}\""
-                
-                    #Support VLC with the proper command line
-                    elif "vlc.exe" in self.external_player_command:
-                        user_agent_argument = f"--http-user-agent=\"{self.current_user_agent}\""
-                        player_cmd = f"{self.external_player_command} {user_agent_argument} \"{url}\""
+                elif is_windows:
+                    # Windows: we build a single command string so each player's
+                    # quoting expectations are met EXACTLY — list2cmdline wraps each
+                    # arg in outer quotes, which breaks PotPlayer's `/key="value"`
+                    # parser (it expects the quotes INSIDE the value, not around the
+                    # whole token). See issue #47 and the regression the user reported
+                    # after the first round of fixes.
+                    exe_q = f'"{self.external_player_command}"'
+                    url_q = f'"{url}"'
 
-                    #Default support, run without user agent argument (e.g. MPC-HC is without user agent argument)
+                    if "potplayermini64.exe" in exe_lower or "potplayer" in exe_lower:
+                        ua_arg = f' /user_agent="{ua}"' if ua else ""
+                        player_cmd = f'{exe_q} {url_q}{ua_arg}'
+
+                    elif exe_lower.endswith(("mpv.exe", "mpv.com")) or "\\mpv\\" in exe_lower:
+                        ua_arg = f' --user-agent="{ua}"' if ua else ""
+                        player_cmd = f'{exe_q}{ua_arg} {url_q}'
+
+                    elif exe_lower.endswith("vlc.exe"):
+                        ua_arg = f' --http-user-agent="{ua}"' if ua else ""
+                        player_cmd = f'{exe_q}{ua_arg} {url_q}'
+
                     else:
-                        player_cmd = f"{self.external_player_command} \"{url}\""
+                        # MPC-HC, MPC-BE, generic players: just exe + URL.
+                        player_cmd = f'{exe_q} {url_q}'
 
                     subprocess.Popen(player_cmd)
 
+                else:
+                    subprocess.Popen([self.external_player_command, url])
+
             except Exception as e:
+                import traceback
                 self.animate_progress(0, 100, "Failed playing stream")
                 print(f"Failed playing stream [{url}]: {e}")
+                traceback.print_exc()
+                try:
+                    error_dialog = QMessageBox(self)
+                    error_dialog.setIcon(QMessageBox.Warning)
+                    error_dialog.setWindowTitle("Player failed to launch")
+                    error_dialog.setText(
+                        f"Could not launch the external player.\n\n"
+                        f"Player: {self.external_player_command}\n"
+                        f"Error: {e}\n\n"
+                        f"See log.txt for the full traceback."
+                    )
+                    error_dialog.setStandardButtons(QMessageBox.Ok)
+                    error_dialog.exec_()
+                except Exception:
+                    pass
         else:
             #Create warning message box to indicate error
             error_dialog = QMessageBox()
@@ -2296,8 +2667,122 @@ class IPTVPlayerApp(QMainWindow):
                 self.external_player_command = file_paths[0]
 
                 self.save_external_player_command()
+                self._refresh_current_player_label()
 
                 self.animate_progress(0, 100, "Selected external media player")
+
+    def use_embedded_player(self):
+        # User clicked "Use Internal Player (VLC)". Check libvlc is reachable BEFORE
+        # we persist the choice — otherwise the user gets a silent failure later
+        # when they try to play something.
+        if not EmbeddedPlayerWindow.is_available():
+            error_dialog = QMessageBox(self)
+            error_dialog.setIcon(QMessageBox.Warning)
+            error_dialog.setWindowTitle("Embedded player unavailable")
+            error_dialog.setText(
+                "The internal VLC player needs libvlc installed on this machine.\n\n"
+                "Install VLC from https://www.videolan.org/vlc/ and then click this button again.\n"
+                "(After installing, you may also need: pip install python-vlc)"
+            )
+            error_dialog.setStandardButtons(QMessageBox.Ok)
+            error_dialog.exec_()
+            return
+
+        self.external_player_command = "<embedded-vlc>"
+        self.save_external_player_command()
+        self._refresh_current_player_label()
+        self.animate_progress(0, 100, "Internal VLC player enabled")
+
+    def _refresh_current_player_label(self):
+        if not hasattr(self, "current_player_label"):
+            return
+        cmd = getattr(self, "external_player_command", "") or ""
+        if cmd == "<embedded-vlc>":
+            self.current_player_label.setText("Active player: Internal VLC (embedded)")
+        elif cmd:
+            self.current_player_label.setText(f"Active player: {cmd}")
+        else:
+            self.current_player_label.setText("No player selected — choose one above.")
+
+    def _play_embedded(self, url):
+        # Lazily create the embedded VLC window — keeping a single instance lets
+        # the user switch channels without rebuilding the libvlc context each time.
+        if not hasattr(self, "_embedded_player_window") or self._embedded_player_window is None:
+            try:
+                self._embedded_player_window = EmbeddedPlayerWindow(self, user_agent=self.current_user_agent)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                error_dialog = QMessageBox(self)
+                error_dialog.setIcon(QMessageBox.Critical)
+                error_dialog.setWindowTitle("Embedded player error")
+                error_dialog.setText(
+                    f"Could not start the internal VLC player:\n{e}\n\n"
+                    "Install VLC from https://www.videolan.org/vlc/ and try again."
+                )
+                error_dialog.exec_()
+                return
+
+        try:
+            playlist, current_idx, title = self._collect_visible_playlist(url)
+            self._embedded_player_window.play_url(
+                url, title=title, playlist=playlist, index=current_idx,
+            )
+            self.animate_progress(0, 100, "Playing in internal player")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.animate_progress(0, 100, "Failed playing stream")
+            print(f"Embedded play failed [{url}]: {e}")
+
+    def _collect_visible_playlist(self, url):
+        # Build the player's sidebar list from what's CURRENTLY VISIBLE in the main
+        # window — i.e. iterate the actual QListWidget the user just clicked from,
+        # not the cached `currently_loaded_streams` array. For Series in episode
+        # mode (navigation level 2) that means the list shows episodes of the open
+        # season; for movies it's the open category; for LIVE it's the open category.
+        try:
+            current_tab_idx = self.tab_widget.currentIndex()
+            tab_name = self.tab_widget.tabText(current_tab_idx)
+            stream_type = {'LIVE': 'LIVE', 'Movies': 'Movies', 'Series': 'Series'}.get(tab_name, 'LIVE')
+
+            list_widget = self.streaming_list_widgets.get(stream_type)
+            playlist = []
+            current_idx = 0
+            title = ""
+
+            if list_widget is not None:
+                for i in range(list_widget.count()):
+                    item = list_widget.item(i)
+                    if item is None:
+                        continue
+                    text = item.text()
+                    # Skip the "Go back" row and any placeholder rows that have no data.
+                    if text == self.go_back_text or text == "No items in list..." or text == "No search results found...":
+                        continue
+                    data = item.data(Qt.UserRole)
+                    if not isinstance(data, dict):
+                        continue
+                    u = data.get('url')
+                    name = data.get('name') or data.get('title') or text
+                    if not u:
+                        # Series-level rows (no URL) — drop them so Next/Prev only walks playable items.
+                        continue
+                    playlist.append({'name': name, 'url': u})
+                    if u == url:
+                        current_idx = len(playlist) - 1
+                        title = name
+
+            if not playlist:
+                sel = self.streaming_list_widgets[stream_type].currentItem() if list_widget else None
+                title = sel.text() if sel else ""
+                playlist = [{'name': title or url, 'url': url}]
+                current_idx = 0
+
+            return playlist, current_idx, title
+        except Exception as e:
+            print(f"Could not build embedded playlist: {e}")
+            return [{'name': url, 'url': url}], 0, ""
 
     def SearchBarKeyPressed(self, e, search_bar, list_content_type, stream_type, list_widgets, history_list, history_list_idx):
         search_history_size = len(history_list)
@@ -2437,8 +2922,15 @@ class IPTVPlayerApp(QMainWindow):
                     case 1: #Seasons
                         self.streaming_list_widgets[stream_type].addItem(self.go_back_text)
 
-                        for season in self.currently_loaded_streams['Seasons'].keys():
-                            if text.lower() in f"season {season}":
+                        # Sort numerically so "Season 10" follows "Season 9" (issue #18).
+                        def _season_sort_key(k):
+                            try:
+                                return (0, int(k))
+                            except (TypeError, ValueError):
+                                return (1, str(k).lower())
+
+                        for season in sorted(self.currently_loaded_streams['Seasons'].keys(), key=_season_sort_key):
+                            if text.lower() in f"season {season}".lower():
                                 item = QListWidgetItem(f"Season {season}")
                                 item.setData(Qt.UserRole, self.currently_loaded_streams['Seasons'][season])
 
@@ -2463,38 +2955,132 @@ class IPTVPlayerApp(QMainWindow):
             print(f"search in list failed: {e}")
 
     def load_external_player_command(self):
-        external_player_command = ""
-
         config = configparser.ConfigParser()
-        config.read(self.user_data_file)
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
 
-        if 'ExternalPlayer' in config:
-            # self.external_player_command = config['ExternalPlayer'].get('Command', '')
-            external_player_command = config['ExternalPlayer'].get('Command', '')
+        if config.has_option('ExternalPlayer', 'Command'):
+            return config['ExternalPlayer'].get('Command', '')
 
-        return external_player_command
+        # First-run default: prefer the internal libvlc-backed player when it's
+        # actually usable on this machine. If libvlc isn't present we leave the
+        # command empty so the user is nudged toward "Choose Media Player".
+        try:
+            if EmbeddedPlayerWindow.is_available():
+                default_cmd = "<embedded-vlc>"
+                # Persist the choice so the user can see "Active player: Internal VLC"
+                # in Settings without having to click anything.
+                config['ExternalPlayer'] = {'Command': default_cmd}
+                try:
+                    with open(self.user_data_file, 'w') as config_file:
+                        config.write(config_file)
+                except OSError:
+                    pass
+                return default_cmd
+        except Exception:
+            pass
+
+        return ""
 
     def save_external_player_command(self):
         config = configparser.ConfigParser()
-        config.read(self.user_data_file)
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
 
         config['ExternalPlayer'] = {'Command': self.external_player_command}
 
-        with open(self.user_data_file, 'w') as config_file:
-            config.write(config_file)
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+        except OSError as e:
+            print(f"Could not write user data file: {e}")
 
     def open_address_book(self):
         dialog = AccountManager(self)
         dialog.exec_()
 
+def _install_logging():
+    # Write every print() / unhandled exception to log.txt next to the script.
+    # The app used to silently die when an external player launch failed; now the
+    # traceback ends up on disk where the user can paste it into a bug report.
+    import logging, atexit, traceback as _tb
+
+    log_path = path.join(path.dirname(path.abspath(__file__)), "log.txt")
+
+    class _StreamToLogger:
+        def __init__(self, original, level):
+            self.original = original
+            self.level    = level
+            self._buf     = ""
+        def write(self, data):
+            try:
+                if self.original is not None:
+                    self.original.write(data)
+            except Exception:
+                pass
+            self._buf += data
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                if line:
+                    logging.log(self.level, line)
+        def flush(self):
+            try:
+                if self.original is not None:
+                    self.original.flush()
+            except Exception:
+                pass
+        def isatty(self):
+            return False
+
+    try:
+        logging.basicConfig(
+            filename=log_path,
+            filemode='a',
+            level=logging.INFO,
+            format='%(asctime)s %(levelname)s %(message)s',
+            encoding='utf-8',
+        )
+    except TypeError:
+        # Python <3.9 has no encoding kwarg — fall back to a manual handler.
+        handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+        handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+        logging.getLogger().addHandler(handler)
+        logging.getLogger().setLevel(logging.INFO)
+
+    sys.stdout = _StreamToLogger(sys.stdout, logging.INFO)
+    sys.stderr = _StreamToLogger(sys.stderr, logging.ERROR)
+
+    def _excepthook(exc_type, exc, tb):
+        logging.error("Unhandled exception:\n%s", "".join(_tb.format_exception(exc_type, exc, tb)))
+        sys.__excepthook__(exc_type, exc, tb)
+    sys.excepthook = _excepthook
+
+    logging.info("=== Session start (log lives at %s) ===", log_path)
+    atexit.register(lambda: logging.info("=== Session end ==="))
+
 def main():
+    _install_logging()
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+
+    # Set an application-wide font that has Arabic/CJK glyphs out of the box —
+    # otherwise non-Latin scripts (Arabic, in particular) render as a row of '?'
+    # because Qt picks a font whose glyph table is missing those code points.
+    if is_windows:
+        app.setFont(QFont("Segoe UI", 10))
+    elif is_mac:
+        app.setFont(QFont("Helvetica Neue", 13))
+    else:
+        # Most Linux desktops have Noto Sans (which covers Arabic via Noto Naskh fallback).
+        app.setFont(QFont("Noto Sans", 10))
+
     player = IPTVPlayerApp()
     player.show()
-    # player.showMaximized()
     QtWidgets.qApp.processEvents()
-    # player.loadDataAtStartup()
     sys.exit(app.exec_())
 
 if __name__ == "__main__":

@@ -7,6 +7,24 @@
 
 This IPTV player, built with Python and PyQt5, supports M3U_plus playlists and Xtream Codes API, allowing users to manage and play IPTV channels, movies, and series.
 
+## What's new in V2
+
+| | |
+|---|---|
+| **Internal player** | Built-in libvlc-backed player window with seek bar, prev/next that walk the visible playlist, sidebar with live filter, subtitle picker, fullscreen, auto-hide controls, mouse-wheel volume, middle-click pause, double-click fullscreen, and persisted volume |
+| **Theme** | Light / Dark / **System** (auto-detects Windows AppsUseLightTheme) |
+| **Internationalization** | Application font set to Segoe UI / Noto Sans / Helvetica Neue so Arabic, CJK, Hebrew etc. render with real glyphs (no more `?` boxes). EPG decoder also tries CP1256 (Arabic ANSI) when UTF-8 fails, so MENA-region providers display correctly |
+| **Stability** | Startup-crash hardening — every `configparser` read is wrapped against `Error` / `UnicodeDecodeError`, every section/key access uses `has_option()`. File-based logging to `log.txt` captures every print, traceback and unhandled exception |
+| **Bug fixes** | #92, #74, #47, #18, #17, #2 / #13 — see the [V2 PR](https://github.com/hossamaladdin/Xtream-m3u_plus-IPTV-Player/tree/v2-fixes-and-internal-player) for the full list |
+
+### Internal player
+
+![Internal player playing a LIVE channel](Screenshots/V2/internal-player-live.png)
+
+Auto-hides 3 s after the last input, wakes on any mouse move / key. Translucent overlay so the video shows through. Cursor hides with the controls (only over the video, never over the bar). Keyboard: `Space` play/pause, `F` fullscreen, `S` cycle subs, `M` mute, `[ / ]` prev / next, `← / →` ±10 s, `↑ / ↓` volume, `L` toggle sidebar, `Esc` exit fullscreen.
+
+
+
 > Feel free to report issues when encountering any problems: [Issues](https://github.com/Youri666/Xtream-m3u_plus-IPTV-Player/issues)
 
 > For sharing ideas and general questions: [Discussions](https://github.com/Youri666/Xtream-m3u_plus-IPTV-Player/discussions)
