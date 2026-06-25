@@ -72,10 +72,14 @@ class FetchDataWorker(QRunnable):
             }
 
             #Create header
+            # Fall back to the default UA when the user hasn't picked one — sending an
+            # empty User-Agent makes some providers return 403 or empty category lists
+            # (related to issues #69 and #10).
+            ua = (self.parent.current_user_agent or "").strip() or DEFAULT_USER_AGENT_HEADER
             headers = {
                 "Connection": CONNECTION_HEADER,
                 "Accept-Encoding": CONTENT_HEADER,
-                "User-Agent": self.parent.current_user_agent
+                "User-Agent": ua
             }
 
             params = {
@@ -120,9 +124,12 @@ class FetchDataWorker(QRunnable):
                     print("Failed loading cache file. Please check if it is empty or corrupted.")
 
             config = configparser.ConfigParser()
-            config.read(self.parent.user_data_file)
+            try:
+                config.read(self.parent.user_data_file)
+            except (configparser.Error, UnicodeDecodeError):
+                config = configparser.ConfigParser()
 
-            if 'Debug' in config and config['Debug']['load_with_cache'] == 'True':   #For testing purposes only
+            if config.has_option('Debug', 'load_with_cache') and config['Debug']['load_with_cache'] == 'True':   #For testing purposes only
                 categories_per_stream_type['LIVE'] = cached_data['LIVE categories']
                 categories_per_stream_type['Movies'] = cached_data['Movies categories']
                 categories_per_stream_type['Series'] = cached_data['Series categories']
@@ -428,10 +435,14 @@ class MovieInfoFetcher(QRunnable):
             #Set request parameters
             # headers = {'User-Agent': CUSTOM_USER_AGENT}
             #Create header
+            # Fall back to the default UA when the user hasn't picked one — sending an
+            # empty User-Agent makes some providers return 403 or empty category lists
+            # (related to issues #69 and #10).
+            ua = (self.parent.current_user_agent or "").strip() or DEFAULT_USER_AGENT_HEADER
             headers = {
                 "Connection": CONNECTION_HEADER,
                 "Accept-Encoding": CONTENT_HEADER,
-                "User-Agent": self.parent.current_user_agent
+                "User-Agent": ua
             }
             host_url = f"{self.server}/player_api.php"
             params = {
@@ -485,10 +496,14 @@ class SeriesInfoFetcher(QRunnable):
             #Set request parameters
             # headers = {'User-Agent': CUSTOM_USER_AGENT}
             #Create header
+            # Fall back to the default UA when the user hasn't picked one — sending an
+            # empty User-Agent makes some providers return 403 or empty category lists
+            # (related to issues #69 and #10).
+            ua = (self.parent.current_user_agent or "").strip() or DEFAULT_USER_AGENT_HEADER
             headers = {
                 "Connection": CONNECTION_HEADER,
                 "Accept-Encoding": CONTENT_HEADER,
-                "User-Agent": self.parent.current_user_agent
+                "User-Agent": ua
             }
             host_url = f"{self.server}/player_api.php"
             params = {
@@ -529,13 +544,21 @@ class ImageFetcher(QRunnable):
     @pyqtSlot()
     def run(self):
         try:
-            #Set header for request
-            # headers = {'User-Agent': CUSTOM_USER_AGENT}
-            #Create header
+            # Skip the network call entirely if the entry didn't have a logo/cover URL —
+            # otherwise requests raises "No scheme supplied" and floods the log.
+            if not self.img_url or not str(self.img_url).strip():
+                image = QPixmap(self.parent.path_to_no_img)
+                self.signals.finished.emit(image, self.stream_type)
+                return
+
+            # Fall back to the default UA when the user hasn't picked one — sending an
+            # empty User-Agent makes some providers return 403 or empty category lists
+            # (related to issues #69 and #10).
+            ua = (self.parent.current_user_agent or "").strip() or DEFAULT_USER_AGENT_HEADER
             headers = {
                 "Connection": CONNECTION_HEADER,
                 "Accept-Encoding": CONTENT_HEADER,
-                "User-Agent": self.parent.current_user_agent
+                "User-Agent": ua
             }
 
             #Request image
@@ -626,10 +649,14 @@ class EPGWorker(QRunnable):
             epg_url = f"{self.server}/player_api.php?username={self.username}&password={self.password}&action=get_simple_data_table&stream_id={self.stream_id}"
             # headers = {'User-Agent': CUSTOM_USER_AGENT}
             #Create header
+            # Fall back to the default UA when the user hasn't picked one — sending an
+            # empty User-Agent makes some providers return 403 or empty category lists
+            # (related to issues #69 and #10).
+            ua = (self.parent.current_user_agent or "").strip() or DEFAULT_USER_AGENT_HEADER
             headers = {
                 "Connection": CONNECTION_HEADER,
                 "Accept-Encoding": CONTENT_HEADER,
-                "User-Agent": self.parent.current_user_agent
+                "User-Agent": ua
             }
 
             #Requesting EPG data
@@ -643,6 +670,18 @@ class EPGWorker(QRunnable):
         except Exception as e:
             self.signals.error.emit(str(e))
 
+    def _decode_epg_text(self, raw_bytes):
+        # EPG payloads come back base64-encoded. Most providers wrap UTF-8 text,
+        # but MENA-region providers (e.g. anghami.us) wrap Windows-1256 (Arabic ANSI).
+        # Decoding cp1256 bytes as UTF-8 either raises or yields mojibake, so try
+        # the common encodings in order and fall back to a replace decode last.
+        for enc in ("utf-8", "utf-8-sig", "cp1256", "iso-8859-6", "cp1252"):
+            try:
+                return raw_bytes.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw_bytes.decode("utf-8", errors="replace")
+
     def decryptEPGData(self, epg_data):
         try:
             decrypted_epg_data = []
@@ -653,9 +692,9 @@ class EPGWorker(QRunnable):
                 stop_timestamp  = datetime.fromtimestamp(int(epg_entry['stop_timestamp']))
                 date            = f"{start_timestamp.day:02}-{start_timestamp.month:02}-{start_timestamp.year}"
 
-                #Decode program name and descryption
-                program_name        = base64.b64decode(epg_entry['title']).decode("utf-8")
-                program_description = base64.b64decode(epg_entry['description']).decode("utf-8")
+                #Decode program name and description — see _decode_epg_text for the encoding fallback.
+                program_name        = self._decode_epg_text(base64.b64decode(epg_entry['title']))
+                program_description = self._decode_epg_text(base64.b64decode(epg_entry['description']))
 
                 #Put only necessary EPG data in list
                 decrypted_epg_data.append({
@@ -687,10 +726,14 @@ class OnlineWorker(QRunnable):
     def run(self):
         try:
             #Create header
+            # Fall back to the default UA when the user hasn't picked one — sending an
+            # empty User-Agent makes some providers return 403 or empty category lists
+            # (related to issues #69 and #10).
+            ua = (self.parent.current_user_agent or "").strip() or DEFAULT_USER_AGENT_HEADER
             headers = {
                 "Connection": CONNECTION_HEADER,
                 "Accept-Encoding": CONTENT_HEADER,
-                "User-Agent": self.parent.current_user_agent
+                "User-Agent": ua
             }
 
             #Requesting stream playlist data
