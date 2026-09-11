@@ -33,7 +33,7 @@ from CustomPyQtWidgets import LiveInfoBox, MovieInfoBox, SeriesInfoBox, Embedded
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher
 
-CURRENT_VERSION = "V2.01.03"
+CURRENT_VERSION = "V2.01.04"
 REMEMBER_CATEGORY_SORTING = "Remember per category"
 
 # CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
@@ -158,6 +158,68 @@ class NetworkSettingsDialog(QDialog):
             self.live_status_checkbox.isChecked()
         )
         self.accept()
+
+
+class CategoryVisibilityDialog(QDialog):
+    """Choose which provider categories remain visible for one content type."""
+
+    def __init__(self, parent, stream_type, categories, hidden_category_ids):
+        super().__init__(parent)
+        self.setWindowTitle(f"Select {stream_type} categories")
+        self.setModal(True)
+        self.resize(520, 620)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Checked categories are displayed. New provider categories are "
+            "automatically checked."
+        ))
+
+        self.category_list = QListWidget()
+        for category in sorted(
+            categories,
+            key=lambda entry: entry.get('category_name', '').casefold()
+        ):
+            category_id = str(category.get('category_id', ''))
+            item = QListWidgetItem(category.get('category_name', ''))
+            item.setData(Qt.UserRole, category_id)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.Unchecked if category_id in hidden_category_ids else Qt.Checked
+            )
+            self.category_list.addItem(item)
+        layout.addWidget(self.category_list)
+
+        selection_buttons = QHBoxLayout()
+        select_all_button = QPushButton("Select all")
+        deselect_all_button = QPushButton("Deselect all")
+        select_all_button.clicked.connect(lambda: self.set_all_checked(True))
+        deselect_all_button.clicked.connect(lambda: self.set_all_checked(False))
+        selection_buttons.addWidget(select_all_button)
+        selection_buttons.addWidget(deselect_all_button)
+        selection_buttons.addStretch()
+        layout.addLayout(selection_buttons)
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def set_all_checked(self, checked):
+        """Apply one check state to every provider category in the dialog."""
+        check_state = Qt.Checked if checked else Qt.Unchecked
+        for row in range(self.category_list.count()):
+            self.category_list.item(row).setCheckState(check_state)
+
+    def hidden_category_ids(self):
+        """Return only unchecked ids so future categories stay visible by default."""
+        return {
+            self.category_list.item(row).data(Qt.UserRole)
+            for row in range(self.category_list.count())
+            if self.category_list.item(row).checkState() != Qt.Checked
+        }
 
 
 class IPTVPlayerApp(QMainWindow):
@@ -320,6 +382,15 @@ class IPTVPlayerApp(QMainWindow):
             'LIVE': {},
             'Movies': {},
             'Series': {}
+        }
+        self.category_list_sort_preferences = {}
+
+        # Store exclusions rather than visible ids so categories introduced by the
+        # provider after an application update remain visible without user action.
+        self.hidden_category_ids = {
+            'LIVE': set(),
+            'Movies': set(),
+            'Series': set()
         }
 
         #Credentials
@@ -864,6 +935,23 @@ class IPTVPlayerApp(QMainWindow):
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(2)
         container_layout.addWidget(search_bar)
+        if list_content_type == 'category':
+            category_visibility_button = QToolButton()
+            category_visibility_button.setText("Categories")
+            category_visibility_button.setIcon(
+                self.style().standardIcon(QtWidgets.QStyle.SP_FileDialogListView)
+            )
+            category_visibility_button.setToolButtonStyle(
+                Qt.ToolButtonTextBesideIcon
+            )
+            category_visibility_button.setToolTip(
+                f"Choose which {stream_type} categories are displayed"
+            )
+            category_visibility_button.clicked.connect(
+                lambda: self.openCategoryVisibilityDialog(stream_type)
+            )
+            search_bar.category_visibility_button = category_visibility_button
+            container_layout.addWidget(category_visibility_button)
         container_layout.addWidget(sort_button)
         container_layout.addWidget(clear_button)
 
@@ -872,6 +960,148 @@ class IPTVPlayerApp(QMainWindow):
             search_bar, list_content_type, stream_type, list_widgets, search_history_list, search_history_list_idx)
 
         return container
+
+    def openCategoryVisibilityDialog(self, stream_type):
+        """Open the visibility editor and apply accepted changes immediately."""
+        categories = self.categories_per_stream_type.get(stream_type, [])
+        if not categories:
+            QMessageBox.information(
+                self,
+                "Categories unavailable",
+                f"No {stream_type} categories have been loaded yet."
+            )
+            return
+
+        dialog = CategoryVisibilityDialog(
+            self,
+            stream_type,
+            categories,
+            self.hidden_category_ids[stream_type]
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        self.hidden_category_ids[stream_type] = dialog.hidden_category_ids()
+        self._save_hidden_categories()
+
+        # All is derived from visible categories, so every cached representation for
+        # this content type becomes stale as soon as the exclusions change.
+        self.category_view_cache[stream_type].clear()
+        self.category_item_cache[stream_type].clear()
+        self.active_category_view_key[stream_type] = None
+        self._refresh_visible_categories(stream_type)
+
+    def _visible_categories(self, stream_type):
+        """Return provider categories that are not explicitly hidden by the user."""
+        hidden_ids = self.hidden_category_ids[stream_type]
+        return [
+            category
+            for category in self.categories_per_stream_type.get(stream_type, [])
+            if str(category.get('category_id', '')) not in hidden_ids
+        ]
+
+    def _entries_in_visible_categories(self, stream_type):
+        """Return entries included in the synthetic All view after exclusions."""
+        visible_category_ids = {
+            str(category.get('category_id'))
+            for category in self._visible_categories(stream_type)
+            if category.get('category_id') is not None
+        }
+        return [
+            entry
+            for entry in self.entries_per_stream_type.get(stream_type, [])
+            if entry.get('category_id') is not None
+            and str(entry.get('category_id')) in visible_category_ids
+        ]
+
+    def _refresh_visible_categories(self, stream_type):
+        """Rebuild one category column and preserve its selection when possible."""
+        previous_name, previous_id = self._selected_category(stream_type)
+        active_category_was_hidden = (
+            previous_name not in (
+                self.all_categories_text, self.fav_categories_text
+            )
+            and str(previous_id) in self.hidden_category_ids[stream_type]
+        )
+        self.currently_loaded_categories[stream_type] = self._visible_categories(
+            stream_type
+        )
+        if active_category_was_hidden:
+            # All must be available as the safe replacement selection.
+            self.category_search_bars[stream_type].clear()
+        search_text = self.category_search_bars[stream_type].text()
+        self.search_in_list('category', stream_type, search_text)
+
+        category_list = self.category_list_widgets[stream_type]
+        selected_row = -1
+        for row in range(category_list.count()):
+            item = category_list.item(row)
+            item_data = item.data(Qt.UserRole) or {}
+            if previous_name in (self.all_categories_text, self.fav_categories_text):
+                matches_previous = item.text() == previous_name
+            else:
+                matches_previous = (
+                    str(item_data.get('category_id', '')) == str(previous_id)
+                )
+            if matches_previous:
+                selected_row = row
+                break
+
+        if selected_row >= 0:
+            category_list.setCurrentRow(selected_row)
+            category_list.itemClicked.emit(category_list.item(selected_row))
+            return
+
+        # If the active category was just hidden, switch to All so the stream list
+        # cannot remain filled with content from a category no longer displayed.
+        if not search_text:
+            all_items = category_list.findItems(
+                self.all_categories_text, Qt.MatchExactly
+            )
+            if all_items:
+                category_list.setCurrentItem(all_items[0])
+                category_list.itemClicked.emit(all_items[0])
+
+    def _load_hidden_categories(self):
+        """Load independent LIVE, Movies, and Series exclusions from userdata.ini."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            return
+
+        if 'Hidden categories' not in config:
+            return
+
+        for stream_type in self.hidden_category_ids:
+            try:
+                hidden_ids = json.loads(
+                    config['Hidden categories'].get(stream_type, '[]')
+                )
+            except (TypeError, ValueError):
+                hidden_ids = []
+            if isinstance(hidden_ids, list):
+                self.hidden_category_ids[stream_type] = {
+                    str(category_id) for category_id in hidden_ids
+                }
+
+    def _save_hidden_categories(self):
+        """Persist category exclusions while preserving every unrelated setting."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+
+        config['Hidden categories'] = {
+            stream_type: json.dumps(sorted(hidden_ids), separators=(',', ':'))
+            for stream_type, hidden_ids in self.hidden_category_ids.items()
+        }
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+        except OSError as e:
+            print(f"Could not save hidden categories: {e}")
 
     def updateSortingMenu(self, search_bar, list_content_type, stream_type):
         """Check the action that matches the order of the list being displayed."""
@@ -902,6 +1132,12 @@ class IPTVPlayerApp(QMainWindow):
         sorting_enabled, sort_order
     ):
         """Apply a menu choice and persist it for the selected category if enabled."""
+        if self.remember_category_sorting and list_content_type == 'category':
+            self.category_list_sort_preferences[stream_type] = (
+                self._sorting_preference_value(sorting_enabled, sort_order)
+            )
+            self._save_category_sort_preferences()
+
         if (
             self.remember_category_sorting
             and list_content_type == 'streaming'
@@ -1303,6 +1539,14 @@ class IPTVPlayerApp(QMainWindow):
                     if value in ('a_z', 'z_a', 'disabled')
                 }
 
+            category_list_preference = config['Category sorting'].get(
+                f'{stream_type}_category_list', ''
+            )
+            if category_list_preference in ('a_z', 'z_a', 'disabled'):
+                self.category_list_sort_preferences[stream_type] = (
+                    category_list_preference
+                )
+
     def _save_category_sort_preferences(self):
         """Store durable sorting preferences in INI; IPTV cache remains disposable."""
         config = configparser.ConfigParser()
@@ -1316,6 +1560,8 @@ class IPTVPlayerApp(QMainWindow):
             for stream_type, preferences in self.category_sort_preferences.items()
         }
         config['Category sorting']['fallback'] = self.category_sort_fallback
+        for stream_type, preference in self.category_list_sort_preferences.items():
+            config['Category sorting'][f'{stream_type}_category_list'] = preference
 
         try:
             with open(self.user_data_file, 'w') as config_file:
@@ -1359,6 +1605,16 @@ class IPTVPlayerApp(QMainWindow):
         )
         preference = self.category_sort_preferences[stream_type].get(
             preference_key, self.category_sort_fallback
+        )
+        return self._sorting_tuple_from_preference(preference)
+
+    def _sorting_for_category_list(self, stream_type):
+        """Return the remembered order for a tab's category column."""
+        if not self.remember_category_sorting:
+            return self.sorting_enabled, self.sorting_order
+
+        preference = self.category_list_sort_preferences.get(
+            stream_type, self.category_sort_fallback
         )
         return self._sorting_tuple_from_preference(preference)
 
@@ -1435,9 +1691,17 @@ class IPTVPlayerApp(QMainWindow):
             self.active_category_view_key[stream_type] = None
 
         if sorting_order == REMEMBER_CATEGORY_SORTING:
-            # Reapply the saved preference for the category currently visible in
-            # each content tab. Category lists themselves keep the A-Z fallback.
+            # Reapply both the category-column order and the preference for the
+            # category currently visible in each content tab.
             for stream_type in self.streaming_list_widgets:
+                category_list_enabled, category_list_order = (
+                    self._sorting_for_category_list(stream_type)
+                )
+                self.sortList(
+                    self.category_search_bars[stream_type], 'category',
+                    stream_type, self.category_list_widgets,
+                    category_list_enabled, category_list_order
+                )
                 category_name, category_id = self._selected_category(stream_type)
                 enabled, order = self._sorting_for_category(
                     stream_type, category_name, category_id
@@ -1860,6 +2124,9 @@ class IPTVPlayerApp(QMainWindow):
 
         #Load default sorting setting
         self.loadDefaultSortingOrder()
+
+        #Load category exclusions before provider data populates the three columns
+        self._load_hidden_categories()
 
         #Load default user agent
         self.loadDefaultUserAgent()
@@ -2339,6 +2606,7 @@ class IPTVPlayerApp(QMainWindow):
         QtWidgets.qApp.processEvents()
 
         #Process categories and entries
+        hidden_categories_changed = False
         for stream_type in self.entries_per_stream_type.keys():
             #Clear category and streaming list
             self.category_list_widgets[stream_type].clear()
@@ -2354,17 +2622,31 @@ class IPTVPlayerApp(QMainWindow):
                 continue
 
             #Fill currently loaded streams with current stream data
-            for entry in self.entries_per_stream_type[stream_type]:
+            for entry in self._entries_in_visible_categories(stream_type):
                 self.currently_loaded_streams[stream_type].append(entry)
 
-            #Fill currently loaded categories with current category data
-            for entry in self.categories_per_stream_type[stream_type]:
+            # Remove exclusions for categories the current provider no longer sends.
+            # This keeps userdata.ini compact without affecting disabled content types.
+            provider_category_ids = {
+                str(category.get('category_id', ''))
+                for category in self.categories_per_stream_type[stream_type]
+            }
+            valid_hidden_ids = (
+                self.hidden_category_ids[stream_type] & provider_category_ids
+            )
+            if valid_hidden_ids != self.hidden_category_ids[stream_type]:
+                self.hidden_category_ids[stream_type] = valid_hidden_ids
+                hidden_categories_changed = True
+
+            # Fill the search source and visible list with non-hidden categories only.
+            visible_categories = self._visible_categories(stream_type)
+            for entry in visible_categories:
                 self.currently_loaded_categories[stream_type].append(entry)
 
             #Add categories in category list
-            num_of_categories = len(self.categories_per_stream_type[stream_type])
+            num_of_categories = len(visible_categories)
             prev_perc = 0
-            for idx, category_item in enumerate(self.categories_per_stream_type[stream_type]):
+            for idx, category_item in enumerate(visible_categories):
                 item = QListWidgetItem(category_item['category_name'])
                 item.setData(Qt.UserRole, category_item)
                 # item.setIcon(channel_icon)
@@ -2372,14 +2654,21 @@ class IPTVPlayerApp(QMainWindow):
                 #Add item to list
                 self.category_list_widgets[stream_type].addItem(item)
 
-                perc = (idx * 100) / num_of_categories
+                perc = (idx * 100) / max(1, num_of_categories)
                 if (perc - prev_perc) > 10:
                     prev_perc = perc
                     self.set_progress_bar(int(perc), f"Loading {stream_type} categories: {idx} of {num_of_categories}")
                     QtWidgets.qApp.processEvents()
 
-            #Sort category list
-            self.sortList(self.category_search_bars[stream_type], 'category', stream_type, self.category_list_widgets, self.sorting_enabled, self.sorting_order)
+            # Sort each first column with its remembered order when that mode is active.
+            category_list_enabled, category_list_order = (
+                self._sorting_for_category_list(stream_type)
+            )
+            self.sortList(
+                self.category_search_bars[stream_type], 'category', stream_type,
+                self.category_list_widgets, category_list_enabled,
+                category_list_order
+            )
 
             # Build the stream list once in its final order. sortList() uses chunked
             # insertion for top-level catalogs so large Movie libraries do not block
@@ -2394,6 +2683,9 @@ class IPTVPlayerApp(QMainWindow):
             self.active_category_view_key[stream_type] = self._category_view_key(
                 stream_type, self.all_categories_text
             )
+
+        if hidden_categories_changed:
+            self._save_hidden_categories()
 
         self.set_progress_bar(100, f"Finished loading")
         QtWidgets.qApp.processEvents()
@@ -2783,7 +3075,7 @@ class IPTVPlayerApp(QMainWindow):
         if is_favorites:
             prepared_entries = self._favorites_in_user_order(stream_type)
         elif category_name == self.all_categories_text:
-            prepared_entries = list(self.entries_per_stream_type[stream_type])
+            prepared_entries = self._entries_in_visible_categories(stream_type)
         else:
             prepared_entries = [
                 entry for entry in self.entries_per_stream_type[stream_type]
@@ -3692,19 +3984,18 @@ class IPTVPlayerApp(QMainWindow):
 
             #If searching in category list
             if list_content_type == 'category':
-                #Check if list is empty
-                if not self.currently_loaded_categories[stream_type]:
-                    return
-
                 list_widget = self.category_list_widgets[stream_type]
                 matching_entries = [
                     entry for entry in self.currently_loaded_categories[stream_type]
                     if normalized_text in entry.get('category_name', '').lower()
                 ]
-                if self.sorting_enabled:
+                category_list_enabled, category_list_order = (
+                    self._sorting_for_category_list(stream_type)
+                )
+                if category_list_enabled:
                     matching_entries.sort(
                         key=lambda entry: entry.get('category_name', '').casefold(),
-                        reverse=(self.sorting_order == 1)
+                        reverse=(category_list_order == 1)
                     )
 
                 # Build the final order once. Keeping Qt automatic sorting enabled
