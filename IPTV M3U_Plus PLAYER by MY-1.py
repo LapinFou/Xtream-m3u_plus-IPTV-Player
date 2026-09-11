@@ -1032,7 +1032,7 @@ class IPTVPlayerApp(QMainWindow):
         for stream_type in ('LIVE', 'Movies', 'Series'):
             checkbox = QCheckBox(stream_type)
             checkbox.setToolTip(
-                f"Show the {stream_type} tab and request its data on the next account load"
+                f"Show the {stream_type} tab and load its data for the active account"
             )
             checkbox.stateChanged.connect(
                 lambda state, selected_type=stream_type:
@@ -1543,7 +1543,9 @@ class IPTVPlayerApp(QMainWindow):
 
     def toggleContentType(self, stream_type, state):
         """Persist one content choice and immediately update tab visibility."""
-        self.content_enabled[stream_type] = bool(state)
+        was_enabled = self.content_enabled[stream_type]
+        is_enabled = bool(state)
+        self.content_enabled[stream_type] = is_enabled
         self._applyContentVisibility()
 
         config = configparser.ConfigParser()
@@ -1560,6 +1562,15 @@ class IPTVPlayerApp(QMainWindow):
                 config.write(config_file)
         except OSError as e:
             print(f"Could not write user data file: {e}")
+
+        # A newly visible tab needs provider data immediately. Reload every enabled
+        # type as one consistent snapshot; the worker still skips disabled endpoints.
+        # With no active account, the normal login path will load it later.
+        if is_enabled and not was_enabled and all(
+            (self.server, self.username, self.password)
+        ):
+            self.set_progress_bar(0, "Reloading enabled content...")
+            self.fetch_data_thread()
     
     def toggle_cache_on_startup(self, state):
         if state == Qt.Checked:
@@ -1810,6 +1821,11 @@ class IPTVPlayerApp(QMainWindow):
             #Clear category and streaming list
             self.category_list_widgets[stream_type].clear()
             self.streaming_list_widgets[stream_type].clear()
+
+            # A reload replaces the previous snapshot. Clearing these search sources
+            # prevents duplicate and stale results after a content type is re-enabled.
+            self.currently_loaded_streams[stream_type] = []
+            self.currently_loaded_categories[stream_type] = []
 
             # Disabled types contain no newly requested data and stay out of the UI.
             if not self.content_enabled[stream_type]:
