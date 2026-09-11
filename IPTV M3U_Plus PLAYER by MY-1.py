@@ -34,7 +34,7 @@ from CustomPyQtWidgets import LiveInfoBox, MovieInfoBox, SeriesInfoBox, Embedded
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher, AccountInfoWorker
 
-CURRENT_VERSION = "V2.01.06"
+CURRENT_VERSION = "V2.01.07"
 REMEMBER_CATEGORY_SORTING = "Remember per category"
 
 # CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
@@ -79,7 +79,6 @@ class NetworkSettingsDialog(QDialog):
         self.parent_app = parent
         self.setWindowTitle("Advanced network settings")
         self.setModal(True)
-        self.resize(620, 320)
 
         main_layout = QVBoxLayout(self)
 
@@ -89,6 +88,12 @@ class NetworkSettingsDialog(QDialog):
         self.user_agent_box = QComboBox()
         self.user_agent_box.addItems(parent.user_agents)
         self.user_agent_box.setCurrentText(parent.current_user_agent)
+        # A full User-Agent can be very long. Give the combo box a practical size
+        # hint so adjustSize() fits the form without making the dialog excessively wide.
+        self.user_agent_box.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.user_agent_box.setMinimumContentsLength(40)
         self.user_agent_box.setToolTip("User-Agent sent with IPTV provider requests")
 
         self.connection_timeout_spin = self._create_seconds_spinbox(
@@ -168,6 +173,11 @@ class NetworkSettingsDialog(QDialog):
         main_layout.addWidget(general_group)
         main_layout.addWidget(live_group)
         main_layout.addWidget(self.button_box)
+
+        # Compute the initial dimensions only after every control has been added.
+        # QDialog remains freely resizable because no fixed size is imposed.
+        main_layout.activate()
+        self.adjustSize()
 
     @staticmethod
     def _create_seconds_spinbox(value, tooltip):
