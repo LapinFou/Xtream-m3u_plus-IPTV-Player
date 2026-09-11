@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (
     QDialog, QFormLayout, QDialogButtonBox, QTabWidget, QListWidgetItem,
     QSpinBox, QMenu, QAction, QTextEdit, QGridLayout, QMessageBox, QListView,
     QTreeWidget, QTreeWidgetItem, QTreeView, QAction, QMenu, QComboBox, QSplitter,
-    QGroupBox, QRadioButton, QButtonGroup
+    QGroupBox, QRadioButton, QButtonGroup, QToolButton
 )
 
 from AccountManager import AccountManager
@@ -284,6 +284,8 @@ class IPTVPlayerApp(QMainWindow):
         #Create search bar dicts
         self.category_search_bars   = {}
         self.streaming_search_bars  = {}
+        self.category_search_widgets = {}
+        self.streaming_search_widgets = {}
 
         #Create sorting all lists setting variable. Set sorting to A-Z by default.
         self.sorting_enabled    = True
@@ -340,7 +342,7 @@ class IPTVPlayerApp(QMainWindow):
         live_category_container = QWidget()
         live_category_layout = QVBoxLayout(live_category_container)
         live_category_layout.setContentsMargins(0, 0, 0, 0)
-        live_category_layout.addWidget(self.category_search_bars["LIVE"])
+        live_category_layout.addWidget(self.category_search_widgets["LIVE"])
         live_category_layout.addWidget(self.category_list_live)
 
         # Set width limits
@@ -350,7 +352,7 @@ class IPTVPlayerApp(QMainWindow):
         live_streaming_container = QWidget()
         live_streaming_layout = QVBoxLayout(live_streaming_container)
         live_streaming_layout.setContentsMargins(0, 0, 0, 0)
-        live_streaming_layout.addWidget(self.streaming_search_bars["LIVE"])
+        live_streaming_layout.addWidget(self.streaming_search_widgets["LIVE"])
         live_streaming_layout.addWidget(self.streaming_list_live)
 
         # Set width limits
@@ -388,7 +390,7 @@ class IPTVPlayerApp(QMainWindow):
         movies_category_container = QWidget()
         movies_category_layout = QVBoxLayout(movies_category_container)
         movies_category_layout.setContentsMargins(0, 0, 0, 0)
-        movies_category_layout.addWidget(self.category_search_bars["Movies"])
+        movies_category_layout.addWidget(self.category_search_widgets["Movies"])
         movies_category_layout.addWidget(self.category_list_movies)
 
         # Set width limits
@@ -398,7 +400,7 @@ class IPTVPlayerApp(QMainWindow):
         movies_streaming_container = QWidget()
         movies_streaming_layout = QVBoxLayout(movies_streaming_container)
         movies_streaming_layout.setContentsMargins(0, 0, 0, 0)
-        movies_streaming_layout.addWidget(self.streaming_search_bars["Movies"])
+        movies_streaming_layout.addWidget(self.streaming_search_widgets["Movies"])
         movies_streaming_layout.addWidget(self.streaming_list_movies)
 
         # Set width limits
@@ -436,7 +438,7 @@ class IPTVPlayerApp(QMainWindow):
         series_category_container = QWidget()
         series_category_layout = QVBoxLayout(series_category_container)
         series_category_layout.setContentsMargins(0, 0, 0, 0)
-        series_category_layout.addWidget(self.category_search_bars["Series"])
+        series_category_layout.addWidget(self.category_search_widgets["Series"])
         series_category_layout.addWidget(self.category_list_series)
 
         # Set width limits
@@ -446,7 +448,7 @@ class IPTVPlayerApp(QMainWindow):
         series_streaming_container = QWidget()
         series_streaming_layout = QVBoxLayout(series_streaming_container)
         series_streaming_layout.setContentsMargins(0, 0, 0, 0)
-        series_streaming_layout.addWidget(self.streaming_search_bars["Series"])
+        series_streaming_layout.addWidget(self.streaming_search_widgets["Series"])
         series_streaming_layout.addWidget(self.streaming_list_series)
 
         # Set width limits
@@ -635,28 +637,28 @@ class IPTVPlayerApp(QMainWindow):
         #Initialize search bars for category lists
         self.category_search_bars["LIVE"] = QLineEdit()
         self.category_search_bars["LIVE"].setPlaceholderText("Search Live TV Categories...")
-        self.configSearchBar(self.category_search_bars["LIVE"], 'category', 'LIVE', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
+        self.category_search_widgets["LIVE"] = self.configSearchBar(self.category_search_bars["LIVE"], 'category', 'LIVE', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
 
         self.category_search_bars["Movies"] = QLineEdit()
         self.category_search_bars["Movies"].setPlaceholderText("Search Movies Categories...")
-        self.configSearchBar(self.category_search_bars["Movies"], 'category', 'Movies', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
+        self.category_search_widgets["Movies"] = self.configSearchBar(self.category_search_bars["Movies"], 'category', 'Movies', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
 
         self.category_search_bars["Series"] = QLineEdit()
         self.category_search_bars["Series"].setPlaceholderText("Search Series Categories...")
-        self.configSearchBar(self.category_search_bars["Series"], 'category', 'Series', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
+        self.category_search_widgets["Series"] = self.configSearchBar(self.category_search_bars["Series"], 'category', 'Series', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
 
         #Initialize search bars for streaming content lists
         self.streaming_search_bars["LIVE"] = QLineEdit()
         self.streaming_search_bars["LIVE"].setPlaceholderText("Search Live TV Channels...")
-        self.configSearchBar(self.streaming_search_bars["LIVE"], 'streaming', 'LIVE', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
+        self.streaming_search_widgets["LIVE"] = self.configSearchBar(self.streaming_search_bars["LIVE"], 'streaming', 'LIVE', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
 
         self.streaming_search_bars["Movies"] = QLineEdit()
         self.streaming_search_bars["Movies"].setPlaceholderText("Search Movies...")
-        self.configSearchBar(self.streaming_search_bars["Movies"], 'streaming', 'Movies', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
+        self.streaming_search_widgets["Movies"] = self.configSearchBar(self.streaming_search_bars["Movies"], 'streaming', 'Movies', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
 
         self.streaming_search_bars["Series"] = QLineEdit()
         self.streaming_search_bars["Series"].setPlaceholderText("Search Series...")
-        self.configSearchBar(self.streaming_search_bars["Series"], 'streaming', 'Series', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
+        self.streaming_search_widgets["Series"] = self.configSearchBar(self.streaming_search_bars["Series"], 'streaming', 'Series', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
 
     def configSearchBar(self, search_bar, list_content_type, stream_type, list_widgets, search_history_list, search_history_list_idx):
         #Create sorting actions
@@ -667,31 +669,51 @@ class IPTVPlayerApp(QMainWindow):
         #Add search icon
         search_bar.addAction(self.search_icon, QLineEdit.LeadingPosition)
 
+        # Use a real tool button for the menu. A QAction embedded in QLineEdit may
+        # consume the first click only to focus the editor on Windows, which makes
+        # the user click another column before the sorting menu becomes available.
+        sort_button = QToolButton()
+        sort_button.setIcon(self.sorting_icon)
+        sort_button.setToolTip("Set sorting order")
+        sort_button.setPopupMode(QToolButton.InstantPopup)
+
         #Create sorting action menu
-        sorting_menu = QMenu()
+        sorting_menu = QMenu(sort_button)
         sorting_menu.setTitle("Set sorting order:")
         sorting_menu.addActions([sort_a_z, sort_z_a, sort_disabled])
-
-        #Create sorting button
-        sort_action = QAction(self.sorting_icon, "sort", self)
-        sort_action.setMenu(sorting_menu)
-        search_bar.addAction(sort_action, QLineEdit.TrailingPosition)
+        sort_button.setMenu(sorting_menu)
 
         #Connect functions to sorting actions
         sort_a_z.triggered.connect(lambda: self.sortList(search_bar, list_content_type, stream_type, list_widgets, True, 0))
         sort_z_a.triggered.connect(lambda: self.sortList(search_bar, list_content_type, stream_type, list_widgets, True, 1))
         sort_disabled.triggered.connect(lambda: self.sortList(search_bar, list_content_type, stream_type, list_widgets, False, 0))
 
-        #Create clear search button
-        clear_action = QAction(self.clear_btn_icon, "clear", self)
-        search_bar.addAction(clear_action, QLineEdit.TrailingPosition)
+        # Keep clearing independent from editor focus for the same reason.
+        clear_button = QToolButton()
+        clear_button.setIcon(self.clear_btn_icon)
+        clear_button.setToolTip("Clear search")
 
         #Connect function to clear search action
-        clear_action.triggered.connect(lambda: self.clearSearch(search_bar, list_content_type, stream_type, list_widgets, search_history_list_idx))
+        clear_button.clicked.connect(lambda: self.clearSearch(search_bar, list_content_type, stream_type, list_widgets, search_history_list_idx))
+
+        # Store references on the editor for tests and future UI customization.
+        search_bar.sort_button = sort_button
+        search_bar.clear_button = clear_button
+        search_bar.sorting_menu = sorting_menu
+
+        container = QWidget()
+        container_layout = QHBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(2)
+        container_layout.addWidget(search_bar)
+        container_layout.addWidget(sort_button)
+        container_layout.addWidget(clear_button)
 
         #Connect function to process search bar key presses
         search_bar.keyPressEvent = lambda e: self.SearchBarKeyPressed(e, 
             search_bar, list_content_type, stream_type, list_widgets, search_history_list, search_history_list_idx)
+
+        return container
 
     def clearSearch(self, search_bar, list_content_type, stream_type, list_widgets, history_list_idx):
         #Clear search bar
