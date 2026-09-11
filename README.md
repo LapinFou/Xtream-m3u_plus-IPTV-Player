@@ -208,4 +208,23 @@ pyinstaller --version
 `chmod +x build_iptv_player.sh`
 - Run the [./build_iptv_player.sh](build_iptv_player.sh) file to start the process.
 
+## macOS Project Setup Instructions
+
+### 1. Install the required applications
+- Install the latest Python 3 from [python.org](https://www.python.org/downloads/macos/).
+- Install the latest VLC from [videolan.org](https://www.videolan.org/vlc/) in `/Applications`.
+
+### 2. Install the build dependencies
+
+```bash
+python3 -m pip install --upgrade pip setuptools pyinstaller
+python3 -m pip install --upgrade requests lxml python-dateutil PyQt5
+```
+
+### 3. Build the application
+- Make the macOS script executable with the command:\
+`chmod +x build_iptv_player_macos.sh`
+- Run [./build_iptv_player_macos.sh](build_iptv_player_macos.sh).
+- The generated application is written to the `dist` folder.
+
 </details>

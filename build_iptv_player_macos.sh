@@ -2,25 +2,24 @@
 
 set -e
 
-# Use the same Python interpreter for dependency checks and the build.
-if command -v python3 &> /dev/null; then
-  PYTHON_BIN=python3
-elif command -v python &> /dev/null; then
-  PYTHON_BIN=python
-else
-  echo "Python was not found. Install Python 3 and try again."
+# Use Python 3 consistently for dependency checks and the PyInstaller build.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "Python 3 was not found. Install it and try again."
   exit 1
 fi
 
-# Check if PyInstaller is installed for the selected Python interpreter.
-if ! "$PYTHON_BIN" -m PyInstaller --version &> /dev/null; then
+PYTHON_BIN=python3
+MAIN_SCRIPT="IPTV M3U_Plus PLAYER by MY-1.py"
+BUILD_PATH="build"
+DIST_PATH="dist"
+
+# PyInstaller and python-vlc must belong to the interpreter used for packaging.
+if ! "$PYTHON_BIN" -m PyInstaller --version >/dev/null 2>&1; then
   echo "PyInstaller not found. Please install it with '$PYTHON_BIN -m pip install pyinstaller'"
   exit 1
 fi
 
-# The internal player imports python-vlc lazily, so verify the binding explicitly.
-# Install it only when missing to keep normal rebuilds fast and offline-friendly.
-if ! "$PYTHON_BIN" -c "import vlc" &> /dev/null; then
+if ! "$PYTHON_BIN" -c "import vlc" >/dev/null 2>&1; then
   echo "python-vlc is missing. Installing the required VLC Python binding..."
   if ! "$PYTHON_BIN" -m pip install "python-vlc>=3.0.20000"; then
     echo "ERROR: python-vlc could not be installed. The build has been cancelled."
@@ -28,20 +27,19 @@ if ! "$PYTHON_BIN" -c "import vlc" &> /dev/null; then
   fi
 fi
 
-# Confirm the lazy module can be collected before deleting previous builds.
-if ! "$PYTHON_BIN" -c "import vlc" &> /dev/null; then
-  echo "ERROR: python-vlc is still unavailable. The build has been cancelled."
-  exit 1
+# python-vlc is only a binding. The VLC application supplies libVLC at runtime.
+if [ ! -d "/Applications/VLC.app" ]; then
+  echo "WARNING: VLC was not found in /Applications."
+  echo "Install the latest VLC from https://www.videolan.org/vlc/ before using the internal player."
 fi
 
-echo "python-vlc is available."
+# A macOS bundle needs an ICNS icon. Build without a custom icon when none exists.
+ICON_ARGS=()
+if [ -f "Images/TV_icon.icns" ]; then
+  ICON_ARGS=(--icon "Images/TV_icon.icns")
+fi
 
-# Set variables
-MAIN_SCRIPT="IPTV M3U_Plus PLAYER by MY-1.py"
-BUILD_PATH="build"
-DIST_PATH="dist"
-
-# Remove previous build and dist folders
+# Remove outputs from an earlier build only after dependency checks succeed.
 if [ -d "$BUILD_PATH" ]; then
   echo "Removing old build folder: $BUILD_PATH"
   rm -rf "$BUILD_PATH"
@@ -52,14 +50,14 @@ if [ -d "$DIST_PATH" ]; then
   rm -rf "$DIST_PATH"
 fi
 
-# Run PyInstaller and explicitly collect the lazily imported VLC binding.
+# Explicitly collect vlc because the internal player imports it lazily.
 "$PYTHON_BIN" -m PyInstaller \
   --clean \
   --onefile \
-  --noconsole \
+  --windowed \
   --noconfirm \
   --hidden-import vlc \
-  --icon "Images/TV_icon.ico" \
+  "${ICON_ARGS[@]}" \
   --name "IPTV_Player" \
   --distpath "$DIST_PATH" \
   --workpath "$BUILD_PATH" \
@@ -93,4 +91,4 @@ fi
   "$MAIN_SCRIPT"
 
 echo
-echo -e "\u2714 Build completed. The executable is in the folder $DIST_PATH."
+echo "Build completed. The macOS application is in $DIST_PATH."
