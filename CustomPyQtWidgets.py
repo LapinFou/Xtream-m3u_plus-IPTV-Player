@@ -466,7 +466,6 @@ class EmbeddedPlayerWindow(QMainWindow):
 
         self.instance = vlc.Instance(vlc_args)
         self.player = self.instance.media_player_new()
-        self._bound = False
 
         self._playlist = []   # list of {'name': str, 'url': str, ...}
         self._current_idx = 0
@@ -535,6 +534,8 @@ class EmbeddedPlayerWindow(QMainWindow):
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(self._volume)
         self.vol_slider.setFixedWidth(120)
+        self.btn_audio  = QPushButton("Audio")
+        self.btn_audio.setEnabled(False)
         self.btn_subs   = QPushButton("CC")
         self.btn_subs.setEnabled(False)
         self.btn_fs     = QPushButton("⛶")        # ⛶
@@ -543,11 +544,15 @@ class EmbeddedPlayerWindow(QMainWindow):
 
         for b in (self.btn_prev, self.btn_rewind, self.btn_play, self.btn_ffwd,
                   self.btn_next, self.btn_slow, self.btn_fast, self.btn_mute,
-                  self.btn_subs, self.btn_fs, self.btn_sidebar):
+                  self.btn_audio, self.btn_subs, self.btn_fs, self.btn_sidebar):
             b.setStyleSheet(_BTN_STYLE)
             b.setFixedHeight(34)
             b.setCursor(Qt.PointingHandCursor)
             b.setFocusPolicy(Qt.NoFocus)
+
+        # Play and pause use glyphs with different natural widths. A fixed button
+        # width keeps every neighbouring control stationary when the icon changes.
+        self.btn_play.setFixedWidth(44)
 
         self.btn_prev.setToolTip("Previous (])")
         self.btn_rewind.setToolTip("Rewind 10s (←)")
@@ -557,6 +562,7 @@ class EmbeddedPlayerWindow(QMainWindow):
         self.btn_slow.setToolTip("Slower")
         self.btn_fast.setToolTip("Faster")
         self.btn_mute.setToolTip("Mute (M)")
+        self.btn_audio.setToolTip("Select audio track")
         self.btn_subs.setToolTip("Subtitles (S)")
         self.btn_fs.setToolTip("Fullscreen (F)")
 
@@ -569,6 +575,7 @@ class EmbeddedPlayerWindow(QMainWindow):
         self.btn_fast.clicked.connect(lambda: self._adjust_rate(0.25))
         self.btn_mute.clicked.connect(self.toggle_mute)
         self.vol_slider.valueChanged.connect(self.set_volume)
+        self.btn_audio.clicked.connect(self._show_audio_menu)
         self.btn_subs.clicked.connect(self._show_subs_menu)
         self.btn_fs.clicked.connect(self.toggle_fullscreen)
 
@@ -596,6 +603,7 @@ class EmbeddedPlayerWindow(QMainWindow):
         btn_row.addWidget(self.btn_mute)
         btn_row.addWidget(self.vol_slider)
         btn_row.addSpacing(8)
+        btn_row.addWidget(self.btn_audio)
         btn_row.addWidget(self.btn_subs)
         btn_row.addWidget(self.btn_fs)
 
@@ -743,8 +751,9 @@ class EmbeddedPlayerWindow(QMainWindow):
 
     # ---------- video output binding ----------
     def _bind_video_output(self):
-        if self._bound:
-            return
+        # Always bind before playback. Closing this reusable window can make Qt
+        # recreate the native video handle; retaining the previous binding sent
+        # decoded video to a stale HWND and produced audio with a black picture.
         win_id = int(self.video_frame.winId())
         if sys.platform.startswith("win"):
             self.player.set_hwnd(win_id)
@@ -762,7 +771,6 @@ class EmbeddedPlayerWindow(QMainWindow):
             self.player.video_set_key_input(False)
         except Exception:
             pass
-        self._bound = True
 
     # ---------- transport ----------
     def toggle_play_pause(self):
@@ -857,6 +865,51 @@ class EmbeddedPlayerWindow(QMainWindow):
         tracks = self._subs_tracks()
         # The first track is always "Disable", so >1 means real tracks exist.
         self.btn_subs.setEnabled(len(tracks) > 1)
+
+    # ---------- audio tracks ----------
+    def _audio_tracks(self):
+        """Return the audio tracks currently reported by libVLC."""
+        try:
+            descriptions = self.player.audio_get_track_description() or []
+            return [
+                (
+                    int(track_id),
+                    name.decode("utf-8", errors="replace")
+                    if isinstance(name, bytes) else str(name)
+                )
+                for track_id, name in descriptions
+            ]
+        except Exception:
+            return []
+
+    def _update_audio_button(self):
+        """Enable audio selection only when the media offers multiple tracks."""
+        self.btn_audio.setEnabled(len(self._audio_tracks()) > 1)
+
+    def _show_audio_menu(self):
+        """Show every audio track and mark the one selected by libVLC."""
+        tracks = self._audio_tracks()
+        if not tracks:
+            return
+        menu = QMenu(self)
+        try:
+            current = self.player.audio_get_track()
+        except Exception:
+            current = -1
+        for track_id, name in tracks:
+            action = QAction(name, self)
+            action.setCheckable(True)
+            action.setChecked(track_id == current)
+            action.triggered.connect(
+                lambda _, selected_id=track_id: self._select_audio_track(selected_id)
+            )
+            menu.addAction(action)
+        menu.exec_(self.btn_audio.mapToGlobal(self.btn_audio.rect().bottomLeft()))
+
+    def _select_audio_track(self, track_id):
+        """Select one libVLC audio track from the popup menu."""
+        self.player.audio_set_track(track_id)
+        self._wake_controls()
 
     def _show_subs_menu(self):
         tracks = self._subs_tracks()
@@ -1015,6 +1068,7 @@ class EmbeddedPlayerWindow(QMainWindow):
                 self.seek_slider.setValue(0)
                 self.time_label.setText("LIVE")
             self._update_subs_button()
+            self._update_audio_button()
         except Exception:
             pass
 

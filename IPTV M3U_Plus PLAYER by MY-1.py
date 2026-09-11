@@ -34,7 +34,7 @@ from SearchUtils import normalize_search_text, title_matches_search
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher, AccountInfoWorker
 
-CURRENT_VERSION = "V2.01.08"
+CURRENT_VERSION = "V2.01.09"
 REMEMBER_CATEGORY_SORTING = "Remember per category"
 
 # CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
@@ -48,6 +48,16 @@ is_mac      = sys.platform.startswith('darwin')
 is_linux    = sys.platform.startswith('linux')
 
 GITHUB_REPO = "Youri666/Xtream-m3u_plus-IPTV-Player"
+
+
+def private_url_log_reference(url):
+    """Identify a stream in logs without exposing its host or credentials."""
+    try:
+        from urllib.parse import urlparse
+        final_component = path.basename(urlparse(str(url)).path)
+        return f"<private URL ending in {final_component or 'unknown'}>"
+    except Exception:
+        return "<private URL>"
 
 
 class NetworkSettingsDialog(QDialog):
@@ -2507,10 +2517,17 @@ class IPTVPlayerApp(QMainWindow):
                 try:
                     resp = requests.head(url, allow_redirects=True, timeout=5)
                     if resp.url and resp.url != url:
-                        print(f"Resolved shortened URL: {url} -> {resp.url}")
+                        print(
+                            "Resolved shortened URL: "
+                            f"{private_url_log_reference(url)} -> "
+                            f"{private_url_log_reference(resp.url)}"
+                        )
                         result = _parse(resp.url)
                 except requests.RequestException as e:
-                    print(f"Could not resolve URL '{url}': {e}")
+                    print(
+                        "Could not resolve URL "
+                        f"{private_url_log_reference(url)}: {e}"
+                    )
 
             if result:
                 self.server, self.username, self.password = result
@@ -3786,7 +3803,7 @@ class IPTVPlayerApp(QMainWindow):
 
         if self.external_player_command:
             try:
-                print(f"Going to play: {url}")
+                print(f"Going to play: {private_url_log_reference(url)}")
                 self.animate_progress(0, 100, "Loading player for streaming")
 
                 # Embedded VLC marker — short-circuit before constructing any subprocess
@@ -3849,7 +3866,10 @@ class IPTVPlayerApp(QMainWindow):
             except Exception as e:
                 import traceback
                 self.animate_progress(0, 100, "Failed playing stream", "error")
-                print(f"Failed playing stream [{url}]: {e}")
+                print(
+                    "Failed playing stream "
+                    f"[{private_url_log_reference(url)}]: {e}"
+                )
                 traceback.print_exc()
                 try:
                     error_dialog = QMessageBox(self)
@@ -4014,7 +4034,10 @@ class IPTVPlayerApp(QMainWindow):
             import traceback
             traceback.print_exc()
             self.animate_progress(0, 100, "Failed playing stream", "error")
-            print(f"Embedded play failed [{url}]: {e}")
+            print(
+                "Embedded play failed "
+                f"[{private_url_log_reference(url)}]: {e}"
+            )
 
     def _collect_visible_playlist(self, url):
         # Build the player's sidebar list from what's CURRENTLY VISIBLE in the main
@@ -4345,7 +4368,15 @@ def _install_logging():
     # traceback ends up on disk where the user can paste it into a bug report.
     import logging, atexit, traceback as _tb
 
-    log_path = path.join(path.dirname(path.abspath(__file__)), "log.txt")
+    # In a PyInstaller one-file build, __file__ points into a temporary extraction
+    # directory that is removed on exit. Use the executable directory so diagnostics
+    # remain available beside the EXE after the player closes.
+    application_dir = (
+        path.dirname(path.abspath(sys.executable))
+        if getattr(sys, 'frozen', False)
+        else path.dirname(path.abspath(__file__))
+    )
+    log_path = path.join(application_dir, "log.txt")
 
     class _StreamToLogger:
         def __init__(self, original, level):
