@@ -23,7 +23,8 @@ from PyQt5.QtWidgets import (
     QListWidget, QWidget, QFileDialog, QCheckBox, QSizePolicy, QHBoxLayout,
     QDialog, QFormLayout, QDialogButtonBox, QTabWidget, QListWidgetItem,
     QSpinBox, QMenu, QAction, QTextEdit, QGridLayout, QMessageBox, QListView,
-    QTreeWidget, QTreeWidgetItem, QTreeView, QAction, QMenu, QComboBox, QSplitter
+    QTreeWidget, QTreeWidgetItem, QTreeView, QAction, QMenu, QComboBox, QSplitter,
+    QGroupBox, QRadioButton, QButtonGroup
 )
 
 from AccountManager import AccountManager
@@ -861,21 +862,53 @@ class IPTVPlayerApp(QMainWindow):
         self.address_book_button.setToolTip("Manage IPTV accounts")
         self.address_book_button.clicked.connect(self.open_address_book)
 
-        self.choose_player_button = QPushButton("Choose Media Player")
-        self.choose_player_button.setIcon(self.mediaplayer_icon)
-        self.choose_player_button.setToolTip("Set the Media Player used for watching content, use e.g. VLC or SMPlayer")
-        self.choose_player_button.clicked.connect(self.choose_external_player)
+        # Keep both player choices in one compact group. The radio buttons make the
+        # active mode explicit, while the read-only field exposes the external path
+        # without forcing the Settings tab to display a full-width status sentence.
+        self.player_group_box = QGroupBox("Media player")
+        self.player_group_layout = QGridLayout(self.player_group_box)
 
-        self.use_embedded_player_button = QPushButton("Use Internal Player (VLC)")
-        self.use_embedded_player_button.setIcon(self.mediaplayer_icon)
-        self.use_embedded_player_button.setToolTip(
-            "Play streams inside this window using the built-in libvlc backend.\n"
-            "Requires VLC to be installed on this machine — download from videolan.org."
+        self.internal_player_radio = QRadioButton("Internal VLC")
+        self.internal_player_radio.setToolTip(
+            "Play streams inside the application using the libvlc backend"
         )
-        self.use_embedded_player_button.clicked.connect(self.use_embedded_player)
+
+        self.external_player_radio = QRadioButton("External player")
+        self.external_player_radio.setToolTip(
+            "Play streams with an installed application such as VLC, MPV, or MPC-HC"
+        )
+
+        self.player_mode_group = QButtonGroup(self)
+        self.player_mode_group.setExclusive(True)
+        self.player_mode_group.addButton(self.internal_player_radio)
+        self.player_mode_group.addButton(self.external_player_radio)
+
+        self.external_player_path = QLineEdit()
+        self.external_player_path.setReadOnly(True)
+        self.external_player_path.setPlaceholderText("No external player selected")
+        self.external_player_path.setToolTip(
+            "Path kept for the external player, even while Internal VLC is active"
+        )
+
+        self.choose_player_button = QPushButton("Browse…")
+        self.choose_player_button.setIcon(self.mediaplayer_icon)
+        self.choose_player_button.setToolTip("Select an external media player executable")
+        self.choose_player_button.clicked.connect(self.choose_external_player)
 
         self.current_player_label = QLabel("")
         self.current_player_label.setStyleSheet("color: #5b8def;")
+
+        self.internal_player_radio.toggled.connect(
+            lambda checked: self.use_embedded_player() if checked else None
+        )
+        self.external_player_radio.toggled.connect(self.use_external_player)
+
+        self.player_group_layout.addWidget(self.internal_player_radio, 0, 0)
+        self.player_group_layout.addWidget(self.external_player_radio, 1, 0)
+        self.player_group_layout.addWidget(self.external_player_path, 1, 1)
+        self.player_group_layout.addWidget(self.choose_player_button, 1, 2)
+        self.player_group_layout.addWidget(self.current_player_label, 2, 0, 1, 3)
+        self.player_group_layout.setColumnStretch(1, 1)
 
         self.vods_enabled_checkbox = QCheckBox("VODs enabled")
         self.vods_enabled_checkbox.setToolTip("Load the Movies/Series tabs for the IPTV account")
@@ -952,31 +985,29 @@ class IPTVPlayerApp(QMainWindow):
         )
 
         #Add widgets to settings tab layout
-        self.settings_layout.addWidget(self.address_book_button,                            0, 0)
-        self.settings_layout.addWidget(self.choose_player_button,                           0, 1)
-        self.settings_layout.addWidget(self.use_embedded_player_button,                     0, 2)
-        self.settings_layout.addWidget(self.current_player_label,                          11, 0, 1, 3)
-        self.settings_layout.addWidget(self.vods_enabled_checkbox,                          1, 0)
-        self.settings_layout.addWidget(self.keep_on_top_checkbox,                           2, 0)
-        self.settings_layout.addWidget(QLabel("Default sorting order: "),                   3, 0)
-        self.settings_layout.addWidget(self.default_sorting_order_box,                      3, 1)
-        self.settings_layout.addWidget(self.update_checker,                                 4, 0)
-        self.settings_layout.addWidget(self.auto_update_checkbox,                           4, 1)
-        self.settings_layout.addWidget(self.stream_status_checkbox,                        10, 0)
-        self.settings_layout.addWidget(QLabel("Theme: "),                                 12, 0)
-        self.settings_layout.addWidget(self.theme_select_box,                              12, 1)
+        self.settings_layout.addWidget(self.address_book_button,                            0, 0, 1, 2)
+        self.settings_layout.addWidget(self.player_group_box,                               1, 0, 1, 2)
+        self.settings_layout.addWidget(self.vods_enabled_checkbox,                          2, 0)
+        self.settings_layout.addWidget(self.keep_on_top_checkbox,                           3, 0)
+        self.settings_layout.addWidget(QLabel("Default sorting order: "),                   4, 0)
+        self.settings_layout.addWidget(self.default_sorting_order_box,                      4, 1)
+        self.settings_layout.addWidget(self.update_checker,                                 5, 0)
+        self.settings_layout.addWidget(self.auto_update_checkbox,                           5, 1)
+        self.settings_layout.addWidget(self.stream_status_checkbox,                        11, 0)
+        self.settings_layout.addWidget(QLabel("Theme: "),                                 13, 0)
+        self.settings_layout.addWidget(self.theme_select_box,                              13, 1)
 
         #Advanced options
-        self.settings_layout.addWidget(QLabel("Select User-Agent (Advanced option): "),         5, 0)
-        self.settings_layout.addWidget(self.select_user_agent_box,                              5, 1)
-        self.settings_layout.addWidget(QLabel("Set connection timeout (Advanced option): "),    6, 0)
-        self.settings_layout.addWidget(self.set_connection_timeout,                             6, 1)
-        self.settings_layout.addWidget(QLabel("Set read timeout (Advanced option): "),          7, 0)
-        self.settings_layout.addWidget(self.set_read_timeout,                                   7, 1)
-        self.settings_layout.addWidget(QLabel("Set live status timeout per attempt (Advanced option): "), 8, 0)
-        self.settings_layout.addWidget(self.set_live_status_timeout,                            8, 1)
-        self.settings_layout.addWidget(QLabel("Set live status retries (Advanced option): "),   9, 0)
-        self.settings_layout.addWidget(self.set_live_status_retries,                            9, 1)
+        self.settings_layout.addWidget(QLabel("Select User-Agent (Advanced option): "),         6, 0)
+        self.settings_layout.addWidget(self.select_user_agent_box,                              6, 1)
+        self.settings_layout.addWidget(QLabel("Set connection timeout (Advanced option): "),    7, 0)
+        self.settings_layout.addWidget(self.set_connection_timeout,                             7, 1)
+        self.settings_layout.addWidget(QLabel("Set read timeout (Advanced option): "),          8, 0)
+        self.settings_layout.addWidget(self.set_read_timeout,                                   8, 1)
+        self.settings_layout.addWidget(QLabel("Set live status timeout per attempt (Advanced option): "), 9, 0)
+        self.settings_layout.addWidget(self.set_live_status_timeout,                            9, 1)
+        self.settings_layout.addWidget(QLabel("Set live status retries (Advanced option): "),  10, 0)
+        self.settings_layout.addWidget(self.set_live_status_retries,                           10, 1)
 
         # self.settings_layout.addWidget(self.cache_on_startup_checkbox,  2, 0)
         # self.settings_layout.addWidget(self.reload_data_btn,            3, 0)
@@ -2712,11 +2743,34 @@ class IPTVPlayerApp(QMainWindow):
 
             if len(file_paths) > 0:
                 self.external_player_command = file_paths[0]
+                self.last_external_player_command = self.external_player_command
 
                 self.save_external_player_command()
                 self._refresh_current_player_label()
 
                 self.animate_progress(0, 100, "Selected external media player")
+                return True
+
+        # Keep the previously active mode when the file dialog is cancelled.
+        self._refresh_current_player_label()
+        return False
+
+    def use_external_player(self, checked):
+        """Activate the remembered external player or ask for one when absent."""
+        if not checked:
+            return
+
+        remembered_command = getattr(self, "last_external_player_command", "") or ""
+        if remembered_command:
+            self.external_player_command = remembered_command
+            self.save_external_player_command()
+            self._refresh_current_player_label()
+            self.animate_progress(0, 100, "External media player enabled")
+            return
+
+        # Selecting External player without a remembered executable immediately opens
+        # the chooser. Cancelling restores the mode represented by the active command.
+        self.choose_external_player()
 
     def use_embedded_player(self):
         # User clicked "Use Internal Player (VLC)". Check libvlc is reachable BEFORE
@@ -2733,6 +2787,7 @@ class IPTVPlayerApp(QMainWindow):
             )
             error_dialog.setStandardButtons(QMessageBox.Ok)
             error_dialog.exec_()
+            self._refresh_current_player_label()
             return
 
         self.external_player_command = "<embedded-vlc>"
@@ -2744,12 +2799,31 @@ class IPTVPlayerApp(QMainWindow):
         if not hasattr(self, "current_player_label"):
             return
         cmd = getattr(self, "external_player_command", "") or ""
+
+        # Updating the radio buttons from persisted state must not trigger their
+        # activation handlers and reopen the external-player chooser at startup.
+        self.internal_player_radio.blockSignals(True)
+        self.external_player_radio.blockSignals(True)
         if cmd == "<embedded-vlc>":
             self.current_player_label.setText("Active player: Internal VLC (embedded)")
+            self.internal_player_radio.setChecked(True)
+            self.external_player_radio.setChecked(False)
         elif cmd:
             self.current_player_label.setText(f"Active player: {cmd}")
+            self.internal_player_radio.setChecked(False)
+            self.external_player_radio.setChecked(True)
         else:
-            self.current_player_label.setText("No player selected — choose one above.")
+            self.current_player_label.setText("No player selected")
+            self.internal_player_radio.setChecked(False)
+            self.external_player_radio.setChecked(False)
+        self.internal_player_radio.blockSignals(False)
+        self.external_player_radio.blockSignals(False)
+
+        remembered_command = getattr(self, "last_external_player_command", "") or ""
+        self.external_player_path.setText(remembered_command)
+        external_mode = self.external_player_radio.isChecked()
+        self.external_player_path.setEnabled(external_mode)
+        self.choose_player_button.setEnabled(external_mode)
 
     def _play_embedded(self, url):
         # Lazily create the embedded VLC window — keeping a single instance lets
@@ -3009,7 +3083,12 @@ class IPTVPlayerApp(QMainWindow):
             config = configparser.ConfigParser()
 
         if config.has_option('ExternalPlayer', 'Command'):
-            return config['ExternalPlayer'].get('Command', '')
+            command = config['ExternalPlayer'].get('Command', '')
+            remembered_command = config['ExternalPlayer'].get('LastExternalCommand', '')
+            if command and command != "<embedded-vlc>":
+                remembered_command = command
+            self.last_external_player_command = remembered_command
+            return command
 
         # First-run default: prefer the internal libvlc-backed player when it's
         # actually usable on this machine. If libvlc isn't present we leave the
@@ -3020,6 +3099,7 @@ class IPTVPlayerApp(QMainWindow):
                 # Persist the choice so the user can see "Active player: Internal VLC"
                 # in Settings without having to click anything.
                 config['ExternalPlayer'] = {'Command': default_cmd}
+                self.last_external_player_command = ""
                 try:
                     with open(self.user_data_file, 'w') as config_file:
                         config.write(config_file)
@@ -3029,6 +3109,7 @@ class IPTVPlayerApp(QMainWindow):
         except Exception:
             pass
 
+        self.last_external_player_command = ""
         return ""
 
     def save_external_player_command(self):
@@ -3038,7 +3119,15 @@ class IPTVPlayerApp(QMainWindow):
         except (configparser.Error, UnicodeDecodeError):
             config = configparser.ConfigParser()
 
-        config['ExternalPlayer'] = {'Command': self.external_player_command}
+        # Store the active mode and the last external executable separately. Switching
+        # to Internal VLC must not erase the path the user may want to select again.
+        if self.external_player_command and self.external_player_command != "<embedded-vlc>":
+            self.last_external_player_command = self.external_player_command
+        remembered_command = getattr(self, "last_external_player_command", "") or ""
+        config['ExternalPlayer'] = {
+            'Command': self.external_player_command,
+            'LastExternalCommand': remembered_command
+        }
 
         try:
             with open(self.user_data_file, 'w') as config_file:
