@@ -451,7 +451,7 @@ class EmbeddedPlayerWindow(QMainWindow):
     (each with at least `name` and `url`) plus a starting index.
     """
 
-    def __init__(self, parent=None, user_agent=""):
+    def __init__(self, parent=None, user_agent="", volume_pref_path=None):
         super().__init__(parent)
         self.setWindowTitle("Internal Player")
         self.resize(1080, 640)
@@ -472,9 +472,10 @@ class EmbeddedPlayerWindow(QMainWindow):
         self._sidebar_visible = False
         self._pinned_sidebar = False
         self._is_fullscreen = False
+        self._app_parent = parent
+        self._explicit_volume_pref_path = volume_pref_path
         self._volume = self._load_volume_pref()
         self.player.audio_set_volume(self._volume)
-        self._app_parent = parent  # IPTVPlayerApp, used to access favorites/user-agent
 
         # ---------- Central widgets ----------
         self.video_frame = QFrame()
@@ -1114,6 +1115,8 @@ class EmbeddedPlayerWindow(QMainWindow):
 
     # ---------- volume persistence ----------
     def _volume_pref_path(self):
+        if self._explicit_volume_pref_path:
+            return self._explicit_volume_pref_path
         try:
             return path.join(path.dirname(path.abspath(self._app_parent.user_data_file)),
                              ".embedded_player_volume")

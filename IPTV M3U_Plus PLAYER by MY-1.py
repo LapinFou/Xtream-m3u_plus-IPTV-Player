@@ -8,6 +8,10 @@ import configparser
 import re
 import json
 import html
+import queue
+import threading
+import uuid
+from multiprocessing.connection import Client, Listener
 from lxml import etree, html
 from datetime import datetime
 from dateutil import parser, tz
@@ -34,7 +38,7 @@ from SearchUtils import normalize_search_text, title_matches_search
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher, AccountInfoWorker
 
-CURRENT_VERSION = "V2.01.10"
+CURRENT_VERSION = "V2.01.11"
 REMEMBER_CATEGORY_SORTING = "Remember per category"
 
 # CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
@@ -58,6 +62,13 @@ def private_url_log_reference(url):
         return f"<private URL ending in {final_component or 'unknown'}>"
     except Exception:
         return "<private URL>"
+
+
+class EmbeddedPlayerCommandBridge(QObject):
+    """Deliver commands received off the GUI thread to the player safely."""
+
+    command_received = pyqtSignal(dict)
+    connection_closed = pyqtSignal()
 
 
 class NetworkSettingsDialog(QDialog):
@@ -295,6 +306,13 @@ class IPTVPlayerApp(QMainWindow):
         self.user_data_file = "userdata.ini"
         self.favorites_file = "favorites.json"
         self.cache_file     = "all_cached_data.json"
+
+        # The internal VLC UI runs in a second process. Commands are queued so
+        # sending a large visible playlist can never block the main Qt event loop.
+        self._embedded_player_process = None
+        self._embedded_player_listener = None
+        self._embedded_player_command_queue = None
+        self._embedded_player_sender_thread = None
         # Default values for URL formats
         self.default_url_formats = {
             'live': "{server}/live/{username}/{password}/{stream_id}.{container_extension}",
@@ -747,6 +765,7 @@ class IPTVPlayerApp(QMainWindow):
 
     def closeEvent(self, event):
         self.saveWindowLayout()
+        self._stopEmbeddedPlayerProcess()
         super().closeEvent(event)
 
     def updateUserDataFile(self):
@@ -4005,30 +4024,16 @@ class IPTVPlayerApp(QMainWindow):
         self.choose_player_button.setEnabled(external_mode)
 
     def _play_embedded(self, url):
-        # Lazily create the embedded VLC window — keeping a single instance lets
-        # the user switch channels without rebuilding the libvlc context each time.
-        if not hasattr(self, "_embedded_player_window") or self._embedded_player_window is None:
-            try:
-                self._embedded_player_window = EmbeddedPlayerWindow(self, user_agent=self.current_user_agent)
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                self.set_progress_bar(100, "Failed starting internal VLC player", "error")
-                error_dialog = QMessageBox(self)
-                error_dialog.setIcon(QMessageBox.Critical)
-                error_dialog.setWindowTitle("Embedded player error")
-                error_dialog.setText(
-                    f"Could not start the internal VLC player:\n{e}\n\n"
-                    "Install VLC from https://www.videolan.org/vlc/ and try again."
-                )
-                error_dialog.exec_()
-                return
-
         try:
             playlist, current_idx, title = self._collect_visible_playlist(url)
-            self._embedded_player_window.play_url(
-                url, title=title, playlist=playlist, index=current_idx,
-            )
+            self._ensureEmbeddedPlayerProcess()
+            self._embedded_player_command_queue.put({
+                'command': 'play',
+                'url': url,
+                'title': title,
+                'playlist': playlist,
+                'index': current_idx
+            })
             self.animate_progress(0, 100, "Playing in internal player")
         except Exception as e:
             import traceback
@@ -4038,6 +4043,108 @@ class IPTVPlayerApp(QMainWindow):
                 "Embedded play failed "
                 f"[{private_url_log_reference(url)}]: {e}"
             )
+
+    def _ensureEmbeddedPlayerProcess(self):
+        """Start the isolated player process and its private command channel."""
+        if (
+            self._embedded_player_process is not None
+            and self._embedded_player_process.poll() is None
+            and self._embedded_player_command_queue is not None
+        ):
+            return
+
+        self._closeEmbeddedPlayerListener()
+        auth_key = os.urandom(32)
+        if is_windows:
+            family = 'AF_PIPE'
+            address = rf'\\.\pipe\iptv-player-{uuid.uuid4().hex}'
+        else:
+            import tempfile
+            family = 'AF_UNIX'
+            address = path.join(
+                tempfile.gettempdir(), f'iptv-player-{uuid.uuid4().hex}.sock'
+            )
+
+        listener = Listener(address=address, family=family, authkey=auth_key)
+        environment = os.environ.copy()
+        environment['IPTV_PLAYER_IPC_ADDRESS'] = address
+        environment['IPTV_PLAYER_IPC_FAMILY'] = family
+        environment['IPTV_PLAYER_IPC_AUTH'] = auth_key.hex()
+        environment['IPTV_PLAYER_USER_AGENT'] = self.current_user_agent or ''
+        environment['IPTV_PLAYER_VOLUME_FILE'] = path.abspath(
+            path.join(path.dirname(self.user_data_file), '.embedded_player_volume')
+        )
+
+        if getattr(sys, 'frozen', False):
+            # Tell recent PyInstaller bootloaders that this is a new application
+            # instance, rather than one of their own internal worker processes.
+            environment['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+            command = [sys.executable, '--embedded-player-process']
+        else:
+            command = [sys.executable, path.abspath(__file__), '--embedded-player-process']
+
+        creation_flags = subprocess.CREATE_NO_WINDOW if is_windows else 0
+        try:
+            process = subprocess.Popen(
+                command,
+                env=environment,
+                creationflags=creation_flags
+            )
+        except Exception:
+            listener.close()
+            raise
+
+        command_queue = queue.Queue()
+        self._embedded_player_process = process
+        self._embedded_player_listener = listener
+        self._embedded_player_command_queue = command_queue
+
+        def send_commands():
+            connection = None
+            try:
+                connection = listener.accept()
+                while True:
+                    payload = command_queue.get()
+                    if payload is None:
+                        break
+                    connection.send(payload)
+            except (EOFError, OSError, BrokenPipeError) as error:
+                print(f"Internal player command channel closed: {error}")
+            finally:
+                if connection is not None:
+                    connection.close()
+                listener.close()
+
+        self._embedded_player_sender_thread = threading.Thread(
+            target=send_commands,
+            name='EmbeddedPlayerCommandSender',
+            daemon=True
+        )
+        self._embedded_player_sender_thread.start()
+
+    def _closeEmbeddedPlayerListener(self):
+        """Close resources left by an earlier isolated player instance."""
+        if self._embedded_player_listener is not None:
+            try:
+                self._embedded_player_listener.close()
+            except OSError:
+                pass
+        self._embedded_player_listener = None
+        self._embedded_player_command_queue = None
+
+    def _stopEmbeddedPlayerProcess(self):
+        """Stop the isolated player when the main application exits."""
+        if self._embedded_player_command_queue is not None:
+            self._embedded_player_command_queue.put({'command': 'quit'})
+            self._embedded_player_command_queue.put(None)
+        process = self._embedded_player_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        self._embedded_player_process = None
+        self._closeEmbeddedPlayerListener()
 
     def _collect_visible_playlist(self, url):
         # Build the player's sidebar list from what's CURRENTLY VISIBLE in the main
@@ -4429,21 +4536,101 @@ def _install_logging():
     logging.info("=== Session start (log lives at %s) ===", log_path)
     atexit.register(lambda: logging.info("=== Session end ==="))
 
-def main():
-    _install_logging()
-    app = QApplication(sys.argv)
+
+def _configure_qt_application(app):
+    """Apply the same visual defaults in the main and player processes."""
     app.setStyle('Fusion')
 
-    # Set an application-wide font that has Arabic/CJK glyphs out of the box —
-    # otherwise non-Latin scripts (Arabic, in particular) render as a row of '?'
-    # because Qt picks a font whose glyph table is missing those code points.
+    # Use fonts with broad Unicode coverage so provider titles remain readable.
     if is_windows:
         app.setFont(QFont("Segoe UI", 10))
     elif is_mac:
         app.setFont(QFont("Helvetica Neue", 13))
     else:
-        # Most Linux desktops have Noto Sans (which covers Arabic via Noto Naskh fallback).
         app.setFont(QFont("Noto Sans", 10))
+
+
+def _run_embedded_player_process():
+    """Run the libVLC window separately from the main application process."""
+    address = os.environ.get('IPTV_PLAYER_IPC_ADDRESS', '')
+    family = os.environ.get('IPTV_PLAYER_IPC_FAMILY', '')
+    encoded_auth_key = os.environ.get('IPTV_PLAYER_IPC_AUTH', '')
+    if not address or not family or not encoded_auth_key:
+        return 1
+
+    try:
+        connection = Client(
+            address=address,
+            family=family,
+            authkey=bytes.fromhex(encoded_auth_key)
+        )
+        first_command = connection.recv()
+    except (EOFError, OSError, ValueError):
+        return 1
+
+    # Do not expose the private child-mode argument to Qt's option parser.
+    app = QApplication([sys.argv[0]])
+    _configure_qt_application(app)
+    player = EmbeddedPlayerWindow(
+        None,
+        user_agent=os.environ.get('IPTV_PLAYER_USER_AGENT', ''),
+        volume_pref_path=os.environ.get('IPTV_PLAYER_VOLUME_FILE') or None
+    )
+    bridge = EmbeddedPlayerCommandBridge()
+
+    def handle_command(payload):
+        if payload.get('command') == 'play':
+            player.play_url(
+                payload.get('url', ''),
+                payload.get('title', ''),
+                payload.get('playlist') or [],
+                payload.get('index', 0)
+            )
+        elif payload.get('command') == 'quit':
+            player.close()
+            app.quit()
+
+    bridge.command_received.connect(handle_command)
+    bridge.connection_closed.connect(app.quit)
+
+    def receive_commands():
+        try:
+            while True:
+                payload = connection.recv()
+                if not isinstance(payload, dict):
+                    continue
+                bridge.command_received.emit(payload)
+                if payload.get('command') == 'quit':
+                    break
+        except (EOFError, OSError):
+            bridge.connection_closed.emit()
+
+    receiver = threading.Thread(
+        target=receive_commands,
+        name='EmbeddedPlayerCommandReceiver',
+        daemon=True
+    )
+    receiver.start()
+    handle_command(first_command)
+
+    try:
+        return app.exec_()
+    finally:
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+
+def main():
+    # A frozen one-file executable re-enters this module for its player child.
+    # Handle that mode before configuring the main process and its log file.
+    if '--embedded-player-process' in sys.argv:
+        sys.exit(_run_embedded_player_process())
+
+    _install_logging()
+    app = QApplication(sys.argv)
+    _configure_qt_application(app)
 
     player = IPTVPlayerApp()
     player.show()
