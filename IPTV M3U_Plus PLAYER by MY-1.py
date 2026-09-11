@@ -1193,7 +1193,7 @@ class IPTVPlayerApp(QMainWindow):
             self.animate_progress(0, 100, "Network settings saved")
         except OSError as e:
             print(f"Could not write user data file: {e}")
-            self.animate_progress(0, 100, f"Failed saving network settings: {e}")
+            self.animate_progress(0, 100, f"Failed saving network settings: {e}", "error")
 
     def loadDefaultNetworkOptions(self):
         try:
@@ -1282,7 +1282,7 @@ class IPTVPlayerApp(QMainWindow):
             if enable_update_msg:
                 QMessageBox.warning(self, 'Failed update checker', "Failed checking for updates.\nPlease try again.")
             else:
-                self.animate_progress(0, 100, "Failed checking for updates")
+                self.animate_progress(0, 100, "Failed checking for updates", "error")
 
     def toggleAutoUpdate(self, state):
         checked = bool(state)
@@ -1337,11 +1337,16 @@ class IPTVPlayerApp(QMainWindow):
         self.progress_bar.setMaximum(100)
         self.progress_bar.setFixedHeight(25)
         self.progress_bar.setTextVisible(True)
+        self.set_progress_state("busy")
 
         #Animate progress bar
         self.playlist_progress_animation = QPropertyAnimation(self.progress_bar, b"value")
         self.playlist_progress_animation.setDuration(1000)  # longer duration for smoother animation
         self.playlist_progress_animation.setEasingCurve(QEasingCurve.InOutQuad)
+        self._progress_animation_final_state = "success"
+        self.playlist_progress_animation.finished.connect(
+            self._finish_progress_animation
+        )
 
     def loadDataAtStartup(self):
         #Load external media player
@@ -1591,7 +1596,7 @@ class IPTVPlayerApp(QMainWindow):
         from urllib.parse import urlparse, parse_qs
 
         def _show_invalid():
-            self.animate_progress(0, 100, "Invalid m3u_plus or m3u URL")
+            self.animate_progress(0, 100, "Invalid m3u_plus or m3u URL", "error")
             dlg = QMessageBox(self)
             dlg.setWindowTitle("Error!")
             dlg.setText("M3U plus URL is invalid!\nPlease enter a valid Xtream get.php URL.")
@@ -1635,7 +1640,7 @@ class IPTVPlayerApp(QMainWindow):
             return False
         except Exception as e:
             print(f"Error extracting credentials: {e}")
-            self.animate_progress(0, 100, "Error extracting credentials")
+            self.animate_progress(0, 100, "Error extracting credentials", "error")
             return False
 
     def set_progress_text(self, text):
@@ -1643,18 +1648,54 @@ class IPTVPlayerApp(QMainWindow):
         QtWidgets.qApp.processEvents()
         # QtWidgets.qApp.sendPostedEvents()
 
-    def set_progress_bar(self, val, text):
+    def set_progress_state(self, state):
+        """Apply a stable visual state without relying on message wording."""
+        colors = {
+            "busy": "#2d8fd5",
+            "success": "#2ea44f",
+            "error": "#d64545"
+        }
+        if state not in colors:
+            state = "busy"
+
+        self.progress_bar.setProperty("progressState", state)
+        self.progress_bar.setStyleSheet(
+            "QProgressBar {"
+            " border: 1px solid palette(mid);"
+            " border-radius: 3px;"
+            " background-color: palette(base);"
+            " color: palette(text);"
+            " text-align: center;"
+            "}"
+            f"QProgressBar::chunk {{ background-color: {colors[state]}; }}"
+        )
+
+    def set_progress_bar(self, val, text, state=None):
+        # Values below 100 describe work in progress. A completed operation defaults
+        # to green; callers explicitly pass "error" for unsuccessful completion.
+        progress_state = state or ("success" if val >= 100 else "busy")
+        self.set_progress_state(progress_state)
         self.progress_bar.setFormat(text)
         self.progress_bar.setValue(val)
         QtWidgets.qApp.processEvents()
 
-    def animate_progress(self, start, end, text):
+    def animate_progress(self, start, end, text, state=None):
         self.playlist_progress_animation.stop()
         self.playlist_progress_animation.setStartValue(start)
         self.playlist_progress_animation.setEndValue(end)
+        self._progress_animation_final_state = state or (
+            "success" if end >= 100 else "busy"
+        )
+        # Keep the bar blue during the animation, then expose the final result when
+        # the target value is reached.
+        self.set_progress_state("busy")
         self.set_progress_text(text)
         self.playlist_progress_animation.start()
         QtWidgets.qApp.processEvents()
+
+    def _finish_progress_animation(self):
+        """Apply the success or failure color selected by animate_progress()."""
+        self.set_progress_state(self._progress_animation_final_state)
 
     def login(self):
         # When logging into another server, reset the progress bar
@@ -1826,7 +1867,7 @@ class IPTVPlayerApp(QMainWindow):
 
     def on_fetch_data_error(self, error_msg):
         print(f"Error occurred while fetching data: {error_msg}")
-        self.set_progress_bar(100, "Failed fetching data")
+        self.set_progress_bar(100, "Failed fetching data", "error")
 
     def show_error_msg(self, title, msg):
         QMessageBox.warning(self, title, msg)
@@ -1903,7 +1944,7 @@ class IPTVPlayerApp(QMainWindow):
         #Update progress bar
         if not vod_info:
             print(f"VOD info was empty: {vod_info}")
-            self.set_progress_bar(100, "Failed loading Movie info")
+            self.set_progress_bar(100, "Failed loading Movie info", "error")
         else:
             self.set_progress_bar(100, "Loaded Movie info")
 
@@ -1916,7 +1957,7 @@ class IPTVPlayerApp(QMainWindow):
     def process_series_info(self, series_info_data, is_show_request):
         #If no series info data available
         if not series_info_data:
-            self.animate_progress(0, 100, "Failed fetching series info")
+            self.animate_progress(0, 100, "Failed fetching series info", "error")
             return
 
         #Check if fetch request came from show_seasons()
@@ -2033,7 +2074,7 @@ class IPTVPlayerApp(QMainWindow):
             #Update progress bar
             if not series_info:
                 # print(f"Series info was empty: {series_info}")
-                self.set_progress_bar(100, "Failed loading Series info")
+                self.set_progress_bar(100, "Failed loading Series info", "error")
             else:
                 self.set_progress_bar(100, "Loaded Series info")
 
@@ -2135,7 +2176,7 @@ class IPTVPlayerApp(QMainWindow):
                 json.dump(fav_data, fav_file, indent=4)
 
         except Exception as e:
-            self.animate_progress(0, 100, "Failed adding to favorites")
+            self.animate_progress(0, 100, "Failed adding to favorites", "error")
 
             print(f"Failed adding to favorites: {e}")
 
@@ -2299,7 +2340,7 @@ class IPTVPlayerApp(QMainWindow):
 
     def onEPGFetchError(self, error_msg):
         print(f"Failed fetching EPG data: {error_msg}")
-        self.set_progress_bar(100, "Failed loading EPG data")
+        self.set_progress_bar(100, "Failed loading EPG data", "error")
 
         #Set list view
         item = QTreeWidgetItem(["--/--/----", "--:--", "--:--", "Failed loading EPG data..."])
@@ -2368,6 +2409,7 @@ class IPTVPlayerApp(QMainWindow):
 
         except Exception as e:
             print(f"Failed processing EPG: {e}")
+            self.set_progress_bar(100, "Failed processing EPG data", "error")
 
     def streaming_item_clicked(self, clicked_item):
         try:
@@ -2670,7 +2712,7 @@ class IPTVPlayerApp(QMainWindow):
 
     def play_item(self, url):
         if not url:
-            self.animate_progress(0, 100, "Stream URL not found")
+            self.animate_progress(0, 100, "Stream URL not found", "error")
 
             #Create warning message box to indicate error
             error_dialog = QMessageBox()
@@ -2703,7 +2745,7 @@ class IPTVPlayerApp(QMainWindow):
                 if is_linux:
                     #Ensure the external player command is executable
                     if not os.access(self.external_player_command, os.X_OK):
-                        self.animate_progress(0, 100, "Selected player is not executable")
+                        self.animate_progress(0, 100, "Selected player is not executable", "error")
                         return
 
                     # Linux: list-form Popen is safe (no shell quirks); each player
@@ -2749,7 +2791,7 @@ class IPTVPlayerApp(QMainWindow):
 
             except Exception as e:
                 import traceback
-                self.animate_progress(0, 100, "Failed playing stream")
+                self.animate_progress(0, 100, "Failed playing stream", "error")
                 print(f"Failed playing stream [{url}]: {e}")
                 traceback.print_exc()
                 try:
@@ -2767,6 +2809,7 @@ class IPTVPlayerApp(QMainWindow):
                 except Exception:
                     pass
         else:
+            self.set_progress_bar(100, "No media player configured", "error")
             #Create warning message box to indicate error
             error_dialog = QMessageBox()
             error_dialog.setIcon(QMessageBox.Warning)
@@ -2830,6 +2873,7 @@ class IPTVPlayerApp(QMainWindow):
         # we persist the choice — otherwise the user gets a silent failure later
         # when they try to play something.
         if not EmbeddedPlayerWindow.is_available():
+            self.set_progress_bar(100, "Internal VLC player unavailable", "error")
             error_dialog = QMessageBox(self)
             error_dialog.setIcon(QMessageBox.Warning)
             error_dialog.setWindowTitle("Embedded player unavailable")
@@ -2887,6 +2931,7 @@ class IPTVPlayerApp(QMainWindow):
             except Exception as e:
                 import traceback
                 traceback.print_exc()
+                self.set_progress_bar(100, "Failed starting internal VLC player", "error")
                 error_dialog = QMessageBox(self)
                 error_dialog.setIcon(QMessageBox.Critical)
                 error_dialog.setWindowTitle("Embedded player error")
@@ -2906,7 +2951,7 @@ class IPTVPlayerApp(QMainWindow):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self.animate_progress(0, 100, "Failed playing stream")
+            self.animate_progress(0, 100, "Failed playing stream", "error")
             print(f"Embedded play failed [{url}]: {e}")
 
     def _collect_visible_playlist(self, url):
