@@ -8,6 +8,7 @@ import configparser
 import re
 import json
 import html
+import unicodedata
 from lxml import etree, html
 from datetime import datetime
 from dateutil import parser, tz
@@ -33,7 +34,7 @@ from CustomPyQtWidgets import LiveInfoBox, MovieInfoBox, SeriesInfoBox, Embedded
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher
 
-CURRENT_VERSION = "V2.01.04"
+CURRENT_VERSION = "V2.01.05"
 REMEMBER_CATEGORY_SORTING = "Remember per category"
 
 # CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
@@ -47,6 +48,27 @@ is_mac      = sys.platform.startswith('darwin')
 is_linux    = sys.platform.startswith('linux')
 
 GITHUB_REPO = "Youri666/Xtream-m3u_plus-IPTV-Player"
+
+
+def normalize_search_text(value):
+    """Return searchable text without case, accents, punctuation, or extra spaces."""
+    decomposed = unicodedata.normalize('NFKD', str(value or '').casefold())
+    without_accents = ''.join(
+        character
+        for character in decomposed
+        if not unicodedata.combining(character)
+    )
+    words_and_spaces = ''.join(
+        character if character.isalnum() else ' '
+        for character in without_accents
+    )
+    return ' '.join(words_and_spaces.split())
+
+
+def title_matches_search(title, search_terms):
+    """Match every query term as a partial word anywhere in the normalized title."""
+    normalized_title = normalize_search_text(title)
+    return all(term in normalized_title for term in search_terms)
 
 
 class NetworkSettingsDialog(QDialog):
@@ -935,6 +957,9 @@ class IPTVPlayerApp(QMainWindow):
         container_layout.setContentsMargins(0, 0, 0, 0)
         container_layout.setSpacing(2)
         container_layout.addWidget(search_bar)
+        # Keep the clear action beside the field it affects. It only empties the
+        # search text and never changes sorting or category visibility settings.
+        container_layout.addWidget(clear_button)
         if list_content_type == 'category':
             category_visibility_button = QToolButton()
             category_visibility_button.setText("Categories")
@@ -953,7 +978,6 @@ class IPTVPlayerApp(QMainWindow):
             search_bar.category_visibility_button = category_visibility_button
             container_layout.addWidget(category_visibility_button)
         container_layout.addWidget(sort_button)
-        container_layout.addWidget(clear_button)
 
         #Connect function to process search bar key presses
         search_bar.keyPressEvent = lambda e: self.SearchBarKeyPressed(e, 
@@ -3980,14 +4004,19 @@ class IPTVPlayerApp(QMainWindow):
     def search_in_list(self, list_content_type, stream_type, text):
         try:
             self.set_progress_bar(0, f"Loading search results...")
-            normalized_text = text.lower()
+            # Every normalized query word must occur somewhere in the candidate.
+            # Substring matching intentionally allows partial words without adding
+            # fuzzy-search complexity or unpredictable similarity thresholds.
+            search_terms = normalize_search_text(text).split()
 
             #If searching in category list
             if list_content_type == 'category':
                 list_widget = self.category_list_widgets[stream_type]
                 matching_entries = [
                     entry for entry in self.currently_loaded_categories[stream_type]
-                    if normalized_text in entry.get('category_name', '').lower()
+                    if title_matches_search(
+                        entry.get('category_name', ''), search_terms
+                    )
                 ]
                 category_list_enabled, category_list_order = (
                     self._sorting_for_category_list(stream_type)
@@ -4011,7 +4040,7 @@ class IPTVPlayerApp(QMainWindow):
                         list_widget.addItem(item)
 
                     #if search bar is empty
-                    if not text:
+                    if not search_terms:
                         # Add 'All' and 'Favorites' categories to top
                         itemAll = QListWidgetItem(self.all_categories_text)
                         itemAll.setData(Qt.UserRole, {'category_name': self.all_categories_text})
@@ -4047,7 +4076,9 @@ class IPTVPlayerApp(QMainWindow):
                         case 0: #LIVE/VOD/Series
                             matching_entries = [
                                 entry for entry in self.currently_loaded_streams[stream_type]
-                                if normalized_text in entry['name'].lower()
+                                if title_matches_search(
+                                    entry.get('name', ''), search_terms
+                                )
                             ]
                             if self.sorting_enabled:
                                 matching_entries.sort(
@@ -4070,7 +4101,9 @@ class IPTVPlayerApp(QMainWindow):
 
                             seasons = [
                                 season for season in self.currently_loaded_streams['Seasons']
-                                if normalized_text in f"season {season}".lower()
+                                if title_matches_search(
+                                    f"season {season}", search_terms
+                                )
                             ]
                             if self.sorting_enabled:
                                 seasons.sort(
@@ -4085,7 +4118,9 @@ class IPTVPlayerApp(QMainWindow):
                             list_widget.addItem(self.go_back_text)
                             matching_episodes = [
                                 episode for episode in self.currently_loaded_streams['Episodes']
-                                if normalized_text in episode['title'].lower()
+                                if title_matches_search(
+                                    episode.get('title', ''), search_terms
+                                )
                             ]
                             if self.sorting_enabled:
                                 matching_episodes.sort(
