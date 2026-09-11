@@ -741,55 +741,59 @@ class IPTVPlayerApp(QMainWindow):
             self.animate_progress(0, 100, f"Finished sorting {stream_type} {list_content_type}")
             return
 
-        #Enable or disable sorting
-        list_widget.setSortingEnabled(sorting_enabled)
-
-        #Remove 'All' and 'Favorites' category items
-        if list_content_type == 'category':
-            matches = []
-            for text in [self.all_categories_text, self.fav_categories_text]:
-                matches.extend(list_widget.findItems(text, Qt.MatchExactly))
-
-            for item in matches:
-                idx = list_widget.row(item)
-                list_widget.takeItem(idx)
-
-        if sorting_enabled:
-            #When sorting is enabled, set sort order, 0: A-Z, 1: Z-A
-            list_widget.sortItems(sort_order)
-
-        else:
-            #When sorting is disabled, reload list manually
-            if list_content_type == 'category':
-                self.category_list_widgets[stream_type].clear()
-
-                for entry in self.currently_loaded_categories[stream_type]:
-                    item = QListWidgetItem(entry['category_name'])
-                    item.setData(Qt.UserRole, entry)
-
-                    self.category_list_widgets[stream_type].addItem(item)
-
-            elif list_content_type == 'streaming':
-                self.streaming_list_widgets[stream_type].clear()
-
-                for entry in self.currently_loaded_streams[stream_type]:
-                    item = QListWidgetItem(entry['name'])
-                    item.setData(Qt.UserRole, entry)
-
-                    self.streaming_list_widgets[stream_type].addItem(item)
-
-        #Disable sorting
+        # Keep automatic sorting disabled while changing the list. Enabling it here
+        # already performs a sort, and the former explicit sortItems() call performed
+        # the same expensive work a second time for large Movie catalogs.
         list_widget.setSortingEnabled(False)
+        list_widget.setUpdatesEnabled(False)
 
-        if list_content_type == 'category':
-            #Add 'All' and 'Favorites' categories to top
-            itemAll = QListWidgetItem(self.all_categories_text)
-            itemAll.setData(Qt.UserRole, {'category_name': self.all_categories_text})
-            self.category_list_widgets[stream_type].insertItem(0, itemAll)
+        try:
+            #Remove 'All' and 'Favorites' category items
+            if list_content_type == 'category':
+                matches = []
+                for text in [self.all_categories_text, self.fav_categories_text]:
+                    matches.extend(list_widget.findItems(text, Qt.MatchExactly))
 
-            itemFav = QListWidgetItem(self.fav_categories_text)
-            itemFav.setData(Qt.UserRole, {'category_name': self.fav_categories_text})
-            self.category_list_widgets[stream_type].insertItem(1, itemFav)
+                for item in matches:
+                    idx = list_widget.row(item)
+                    list_widget.takeItem(idx)
+
+            if sorting_enabled:
+                # Perform exactly one native Qt sort after all items are present.
+                list_widget.sortItems(sort_order)
+
+            else:
+                #When sorting is disabled, reload list manually
+                if list_content_type == 'category':
+                    self.category_list_widgets[stream_type].clear()
+
+                    for entry in self.currently_loaded_categories[stream_type]:
+                        item = QListWidgetItem(entry['category_name'])
+                        item.setData(Qt.UserRole, entry)
+
+                        self.category_list_widgets[stream_type].addItem(item)
+
+                elif list_content_type == 'streaming':
+                    self.streaming_list_widgets[stream_type].clear()
+
+                    for entry in self.currently_loaded_streams[stream_type]:
+                        item = QListWidgetItem(entry['name'])
+                        item.setData(Qt.UserRole, entry)
+
+                        self.streaming_list_widgets[stream_type].addItem(item)
+
+            if list_content_type == 'category':
+                #Add 'All' and 'Favorites' categories to top
+                itemAll = QListWidgetItem(self.all_categories_text)
+                itemAll.setData(Qt.UserRole, {'category_name': self.all_categories_text})
+                self.category_list_widgets[stream_type].insertItem(0, itemAll)
+
+                itemFav = QListWidgetItem(self.fav_categories_text)
+                itemFav.setData(Qt.UserRole, {'category_name': self.fav_categories_text})
+                self.category_list_widgets[stream_type].insertItem(1, itemFav)
+        finally:
+            list_widget.setUpdatesEnabled(True)
+            list_widget.viewport().update()
 
         self.animate_progress(0, 100, f"Finished sorting {stream_type} {list_content_type}")
 
@@ -1733,11 +1737,19 @@ class IPTVPlayerApp(QMainWindow):
         progress_state = state or ("success" if val >= 100 else "busy")
         self.set_progress_state(progress_state)
         self.progress_bar.setFormat(text)
-        self.progress_bar.setValue(val)
+        if progress_state == "busy" and val <= 0:
+            # An unknown-duration operation has no meaningful percentage yet. Qt's
+            # 0..0 range displays an animated blue busy bar instead of an empty white
+            # bar that can make the application appear idle or frozen.
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(val)
         QtWidgets.qApp.processEvents()
 
     def animate_progress(self, start, end, text, state=None):
         self.playlist_progress_animation.stop()
+        self.progress_bar.setRange(0, 100)
         self.playlist_progress_animation.setStartValue(start)
         self.playlist_progress_animation.setEndValue(end)
         self._progress_animation_final_state = state or (
@@ -3135,6 +3147,7 @@ class IPTVPlayerApp(QMainWindow):
     def search_in_list(self, list_content_type, stream_type, text):
         try:
             self.set_progress_bar(0, f"Loading search results...")
+            normalized_text = text.lower()
 
             #If searching in category list
             if list_content_type == 'category':
@@ -3142,40 +3155,46 @@ class IPTVPlayerApp(QMainWindow):
                 if not self.currently_loaded_categories[stream_type]:
                     return
 
-                #Enable or disable sorting
-                self.category_list_widgets[stream_type].setSortingEnabled(self.sorting_enabled)
-
-                #When sorting is enabled, set sort order, 0: A-Z, 1: Z-A
+                list_widget = self.category_list_widgets[stream_type]
+                matching_entries = [
+                    entry for entry in self.currently_loaded_categories[stream_type]
+                    if normalized_text in entry.get('category_name', '').lower()
+                ]
                 if self.sorting_enabled:
-                    self.category_list_widgets[stream_type].sortItems(self.sorting_order)
+                    matching_entries.sort(
+                        key=lambda entry: entry.get('category_name', '').casefold(),
+                        reverse=(self.sorting_order == 1)
+                    )
 
-                self.category_list_widgets[stream_type].clear()
-
-                for entry in self.currently_loaded_categories[stream_type]:
-                    if text.lower() in entry.get('category_name', '').lower():
+                # Build the final order once. Keeping Qt automatic sorting enabled
+                # while inserting thousands of matches causes repeated O(n log n)
+                # work and can make the interface appear frozen.
+                list_widget.setSortingEnabled(False)
+                list_widget.setUpdatesEnabled(False)
+                try:
+                    list_widget.clear()
+                    for entry in matching_entries:
                         item = QListWidgetItem(entry['category_name'])
                         item.setData(Qt.UserRole, entry)
+                        list_widget.addItem(item)
 
-                        self.category_list_widgets[stream_type].addItem(item)
+                    #if search bar is empty
+                    if not text:
+                        # Add 'All' and 'Favorites' categories to top
+                        itemAll = QListWidgetItem(self.all_categories_text)
+                        itemAll.setData(Qt.UserRole, {'category_name': self.all_categories_text})
+                        list_widget.insertItem(0, itemAll)
 
-                #Disable sorting
-                self.category_list_widgets[stream_type].setSortingEnabled(False)
+                        itemFav = QListWidgetItem(self.fav_categories_text)
+                        itemFav.setData(Qt.UserRole, {'category_name': self.fav_categories_text})
+                        list_widget.insertItem(1, itemFav)
 
-                #if search bar is empty
-                if not text:
-                    # Add 'All' and 'Favorites' categories to top
-                    itemAll = QListWidgetItem(self.all_categories_text)
-                    itemAll.setData(Qt.UserRole, {'category_name': self.all_categories_text})
-                    self.category_list_widgets[stream_type].insertItem(0, itemAll)
-
-                    itemFav = QListWidgetItem(self.fav_categories_text)
-                    itemFav.setData(Qt.UserRole, {'category_name': self.fav_categories_text})
-                    self.category_list_widgets[stream_type].insertItem(1, itemFav)
-
-                #Check if no search results found
-                num_of_items = self.category_list_widgets[stream_type].count()
-                if not num_of_items:
-                    self.category_list_widgets[stream_type].addItem("No search results found...")
+                    #Check if no search results found
+                    if not list_widget.count():
+                        list_widget.addItem("No search results found...")
+                finally:
+                    list_widget.setUpdatesEnabled(True)
+                    list_widget.viewport().update()
 
             #If searching in streaming content list
             elif list_content_type == 'streaming':
@@ -3183,53 +3202,76 @@ class IPTVPlayerApp(QMainWindow):
                 if not self.currently_loaded_streams[stream_type]:
                     return
 
-                #Enable or disable sorting
-                self.streaming_list_widgets[stream_type].setSortingEnabled(self.sorting_enabled)
+                list_widget = self.streaming_list_widgets[stream_type]
+                list_widget.setSortingEnabled(False)
+                list_widget.setUpdatesEnabled(False)
+                try:
+                    list_widget.clear()
+                    navigation_level = (
+                        self.series_navigation_level if stream_type == 'Series' else 0
+                    )
 
-                #When sorting is enabled, set sort order, 0: A-Z, 1: Z-A
-                if self.sorting_enabled:
-                    self.streaming_list_widgets[stream_type].sortItems(self.sorting_order)
-
-                self.streaming_list_widgets[stream_type].clear()
-
-                match self.series_navigation_level:
-                    case 0: #LIVE/VOD/Series
-                        for entry in self.currently_loaded_streams[stream_type]:
-                            if text.lower() in entry['name'].lower():
+                    match navigation_level:
+                        case 0: #LIVE/VOD/Series
+                            matching_entries = [
+                                entry for entry in self.currently_loaded_streams[stream_type]
+                                if normalized_text in entry['name'].lower()
+                            ]
+                            if self.sorting_enabled:
+                                matching_entries.sort(
+                                    key=lambda entry: entry['name'].casefold(),
+                                    reverse=(self.sorting_order == 1)
+                                )
+                            for entry in matching_entries:
                                 item = QListWidgetItem(entry['name'])
                                 item.setData(Qt.UserRole, entry)
+                                list_widget.addItem(item)
+                        case 1: #Seasons
+                            list_widget.addItem(self.go_back_text)
 
-                                self.streaming_list_widgets[stream_type].addItem(item)
-                    case 1: #Seasons
-                        self.streaming_list_widgets[stream_type].addItem(self.go_back_text)
+                            # Sort numerically so "Season 10" follows "Season 9".
+                            def _season_sort_key(k):
+                                try:
+                                    return (0, int(k))
+                                except (TypeError, ValueError):
+                                    return (1, str(k).lower())
 
-                        # Sort numerically so "Season 10" follows "Season 9" (issue #18).
-                        def _season_sort_key(k):
-                            try:
-                                return (0, int(k))
-                            except (TypeError, ValueError):
-                                return (1, str(k).lower())
-
-                        for season in sorted(self.currently_loaded_streams['Seasons'].keys(), key=_season_sort_key):
-                            if text.lower() in f"season {season}".lower():
+                            seasons = [
+                                season for season in self.currently_loaded_streams['Seasons']
+                                if normalized_text in f"season {season}".lower()
+                            ]
+                            if self.sorting_enabled:
+                                seasons.sort(
+                                    key=_season_sort_key,
+                                    reverse=(self.sorting_order == 1)
+                                )
+                            for season in seasons:
                                 item = QListWidgetItem(f"Season {season}")
                                 item.setData(Qt.UserRole, self.currently_loaded_streams['Seasons'][season])
-
-                                self.streaming_list_widgets[stream_type].addItem(item)
-                    case 2: #Episodes
-                        self.streaming_list_widgets[stream_type].addItem(self.go_back_text)
-
-                        for episode in self.currently_loaded_streams['Episodes']:
-                            if text.lower() in episode['title'].lower():
+                                list_widget.addItem(item)
+                        case 2: #Episodes
+                            list_widget.addItem(self.go_back_text)
+                            matching_episodes = [
+                                episode for episode in self.currently_loaded_streams['Episodes']
+                                if normalized_text in episode['title'].lower()
+                            ]
+                            if self.sorting_enabled:
+                                matching_episodes.sort(
+                                    key=lambda episode: episode['title'].casefold(),
+                                    reverse=(self.sorting_order == 1)
+                                )
+                            for episode in matching_episodes:
                                 item = QListWidgetItem(episode['title'])
                                 item.setData(Qt.UserRole, episode)
+                                list_widget.addItem(item)
 
-                                self.streaming_list_widgets[stream_type].addItem(item)
-
-                #Check if no search results found
-                num_of_items = self.streaming_list_widgets[stream_type].count()
-                if not (num_of_items - (self.series_navigation_level > 0)):
-                    self.streaming_list_widgets[stream_type].addItem("No search results found...")
+                    #Check if no search results found
+                    num_of_items = list_widget.count()
+                    if not (num_of_items - (navigation_level > 0)):
+                        list_widget.addItem("No search results found...")
+                finally:
+                    list_widget.setUpdatesEnabled(True)
+                    list_widget.viewport().update()
 
             self.set_progress_bar(100, f"Loaded search results")
         except Exception as e:
