@@ -17,6 +17,8 @@ import sys
 import configparser
 import json
 
+from SearchUtils import normalize_search_text, title_matches_search
+
 class LiveInfoBox(QWidget):
     def __init__(self, parent=None):
         super().__init__()
@@ -916,11 +918,13 @@ class EmbeddedPlayerWindow(QMainWindow):
             self.sidebar.hide()
 
     def _refresh_sidebar(self):
-        needle = self.sidebar_search.text().strip().lower()
+        # Use the same search rules as the main lists: ignore case, accents,
+        # punctuation, and word order while allowing partial-word matches.
+        search_terms = normalize_search_text(self.sidebar_search.text()).split()
         self.playlist_list.clear()
         for i, entry in enumerate(self._playlist):
             name = entry.get('name', '')
-            if needle and needle not in name.lower():
+            if not title_matches_search(name, search_terms):
                 continue
             item = QListWidgetItem(f"{i + 1:>3}.  {name}")
             item.setData(Qt.UserRole, i)

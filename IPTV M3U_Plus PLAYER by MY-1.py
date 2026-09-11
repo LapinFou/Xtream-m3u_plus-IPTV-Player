@@ -8,7 +8,6 @@ import configparser
 import re
 import json
 import html
-import unicodedata
 from lxml import etree, html
 from datetime import datetime
 from dateutil import parser, tz
@@ -31,10 +30,11 @@ from PyQt5.QtWidgets import (
 
 from AccountManager import AccountManager
 from CustomPyQtWidgets import LiveInfoBox, MovieInfoBox, SeriesInfoBox, EmbeddedPlayerWindow
+from SearchUtils import normalize_search_text, title_matches_search
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher, AccountInfoWorker
 
-CURRENT_VERSION = "V2.01.07"
+CURRENT_VERSION = "V2.01.08"
 REMEMBER_CATEGORY_SORTING = "Remember per category"
 
 # CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
@@ -48,27 +48,6 @@ is_mac      = sys.platform.startswith('darwin')
 is_linux    = sys.platform.startswith('linux')
 
 GITHUB_REPO = "Youri666/Xtream-m3u_plus-IPTV-Player"
-
-
-def normalize_search_text(value):
-    """Return searchable text without case, accents, punctuation, or extra spaces."""
-    decomposed = unicodedata.normalize('NFKD', str(value or '').casefold())
-    without_accents = ''.join(
-        character
-        for character in decomposed
-        if not unicodedata.combining(character)
-    )
-    words_and_spaces = ''.join(
-        character if character.isalnum() else ' '
-        for character in without_accents
-    )
-    return ' '.join(words_and_spaces.split())
-
-
-def title_matches_search(title, search_terms):
-    """Match every query term as a partial word anywhere in the normalized title."""
-    normalized_title = normalize_search_text(title)
-    return all(term in normalized_title for term in search_terms)
 
 
 class NetworkSettingsDialog(QDialog):
@@ -1839,9 +1818,11 @@ class IPTVPlayerApp(QMainWindow):
         self.player_group_box = QGroupBox("Media player")
         self.player_group_layout = QGridLayout(self.player_group_box)
 
-        self.internal_player_radio = QRadioButton("Internal VLC")
+        self.internal_player_radio = QRadioButton(
+            "Internal VLC (requires VLC installed on this computer)"
+        )
         self.internal_player_radio.setToolTip(
-            "Play streams inside the application using the libvlc backend"
+            "Play inside this application using the latest VLC installed on this computer"
         )
 
         self.external_player_radio = QRadioButton("External player")
@@ -3952,11 +3933,14 @@ class IPTVPlayerApp(QMainWindow):
             self.set_progress_bar(100, "Internal VLC player unavailable", "error")
             error_dialog = QMessageBox(self)
             error_dialog.setIcon(QMessageBox.Warning)
-            error_dialog.setWindowTitle("Embedded player unavailable")
+            error_dialog.setWindowTitle("Internal VLC unavailable")
             error_dialog.setText(
-                "The internal VLC player needs libvlc installed on this machine.\n\n"
-                "Install VLC from https://www.videolan.org/vlc/ and then click this button again.\n"
-                "(After installing, you may also need: pip install python-vlc)"
+                "The internal player uses VLC installed on this computer, but a "
+                "compatible VLC installation could not be found.\n\n"
+                "Install the latest VLC version from https://www.videolan.org/vlc/, "
+                "restart this application, and try again.\n\n"
+                "Alternatively, select External player and choose another installed "
+                "media player."
             )
             error_dialog.setStandardButtons(QMessageBox.Ok)
             error_dialog.exec_()
@@ -3978,7 +3962,9 @@ class IPTVPlayerApp(QMainWindow):
         self.internal_player_radio.blockSignals(True)
         self.external_player_radio.blockSignals(True)
         if cmd == "<embedded-vlc>":
-            self.current_player_label.setText("Active player: Internal VLC (embedded)")
+            self.current_player_label.setText(
+                "Active player: Internal VLC (using the installed VLC engine)"
+            )
             self.internal_player_radio.setChecked(True)
             self.external_player_radio.setChecked(False)
         elif cmd:

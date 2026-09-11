@@ -22,6 +22,33 @@ REM Show version
 echo.
 echo PyInstaller version: 
 %PYINSTALLER% --version
+
+REM The embedded player imports python-vlc lazily, so verify the binding explicitly.
+REM Install it only when missing to keep normal rebuilds fast and offline-friendly.
+python -c "import vlc" >nul 2>&1
+IF ERRORLEVEL 1 (
+  echo.
+  echo python-vlc is missing. Installing the required VLC Python binding...
+  python -m pip install "python-vlc>=3.0.20000"
+  IF ERRORLEVEL 1 (
+    echo.
+    echo ERROR: python-vlc could not be installed. The build has been cancelled.
+    echo Check your Internet connection and Python installation, then try again.
+    pause
+    exit /b 1
+  )
+)
+
+REM Confirm that the module is importable before PyInstaller deletes older builds.
+python -c "import vlc" >nul 2>&1
+IF ERRORLEVEL 1 (
+  echo.
+  echo ERROR: python-vlc is still unavailable. The build has been cancelled.
+  pause
+  exit /b 1
+)
+
+echo python-vlc is available.
 pause
 
 REM Main Python script to package
@@ -56,11 +83,13 @@ IF EXIST %DIST_PATH% (
 
 IF "%exec_choice%"=="2" GOTO option2
 
+REM python-vlc is imported lazily, so PyInstaller cannot discover it automatically.
 REM Run PyInstaller directly with all necessary options and added data files
 %PYINSTALLER% ^
   --onefile ^
   --noconsole ^
   --noconfirm ^
+  --hidden-import vlc ^
   --icon "Images/TV_icon.ico" ^
   --name "IPTV_Player" ^
   --workpath %BUILD_PATH% ^
@@ -98,9 +127,11 @@ IF "%exec_choice%"=="1" GOTO end
 
 :option2
 REM Create executable with debug console
+REM Keep the lazy python-vlc import available in the diagnostic build too.
 %PYINSTALLER% ^
   --onefile ^
   --noconfirm ^
+  --hidden-import vlc ^
   --icon "Images/TV_icon.ico" ^
   --name "IPTV_Player_with_debug_console" ^
   --workpath %BUILD_PATH% ^
