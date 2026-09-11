@@ -57,7 +57,8 @@ class FetchDataWorkerSignals(QObject):
     show_info_msg   = pyqtSignal(str, str)
 
 class FetchDataWorker(QRunnable):
-    def __init__(self, server, username, password, live_url_format, movie_url_format, series_url_format, parent=None, fetch_vods=True):
+    def __init__(self, server, username, password, live_url_format, movie_url_format,
+                 series_url_format, parent=None, enabled_stream_types=None):
         super().__init__()
         self.server            = server
         self.username          = username
@@ -65,7 +66,17 @@ class FetchDataWorker(QRunnable):
         self.live_url_format   = live_url_format
         self.movie_url_format  = movie_url_format
         self.series_url_format = series_url_format
-        self.fetch_vods        = fetch_vods
+        # Copy the selection because the Settings checkboxes may change while this
+        # worker is running. A missing value keeps the historical all-content default.
+        enabled_stream_types = enabled_stream_types or {
+            'LIVE': True,
+            'Movies': True,
+            'Series': True
+        }
+        self.enabled_stream_types = {
+            stream_type: bool(enabled_stream_types.get(stream_type, True))
+            for stream_type in ('LIVE', 'Movies', 'Series')
+        }
         self.parent            = parent
         self.signals           = FetchDataWorkerSignals()
 
@@ -142,198 +153,69 @@ class FetchDataWorker(QRunnable):
                 config = configparser.ConfigParser()
 
             if config.has_option('Debug', 'load_with_cache') and config['Debug']['load_with_cache'] == 'True':   #For testing purposes only
-                categories_per_stream_type['LIVE'] = cached_data['LIVE categories']
-                categories_per_stream_type['Movies'] = cached_data['Movies categories']
-                categories_per_stream_type['Series'] = cached_data['Series categories']
-                entries_per_stream_type['LIVE'] = cached_data['LIVE']
-                entries_per_stream_type['Movies'] = cached_data['Movies']
-                entries_per_stream_type['Series'] = cached_data['Series']
+                for stream_type in ('LIVE', 'Movies', 'Series'):
+                    if not self.enabled_stream_types[stream_type]:
+                        continue
+                    categories_per_stream_type[stream_type] = cached_data.get(
+                        f'{stream_type} categories', []
+                    )
+                    entries_per_stream_type[stream_type] = cached_data.get(stream_type, [])
             else:
-                #Get all category data
-                print("Fetching Live TV categories")
-                self.signals.progress_bar.emit(5, 10, "Fetching LIVE Categories")
-                try:
-                    params['action'] = 'get_live_categories'
-                    live_category_resp = requests.get(host_url, params=params, headers=headers, timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT))
-                    live_category_resp.raise_for_status()  #Raises HTTP error is status is 4xx or 5xx
+                # Describe the six provider collections in one table so each content
+                # toggle controls both its category and stream requests consistently.
+                request_plan = (
+                    ('LIVE', 'categories', 'get_live_categories', 'LIVE categories', 5, 10),
+                    ('Movies', 'categories', 'get_vod_categories', 'Movies categories', 10, 20),
+                    ('Series', 'categories', 'get_series_categories', 'Series categories', 20, 30),
+                    ('LIVE', 'streams', 'get_live_streams', 'LIVE', 30, 40),
+                    ('Movies', 'streams', 'get_vod_streams', 'Movies', 40, 60),
+                    ('Series', 'streams', 'get_series', 'Series', 60, 80),
+                )
 
-                    categories_per_stream_type['LIVE'] = live_category_resp.json()
-                except Exception as e:
-                    print(f"failed fetching LIVE categories: {e}")
+                for stream_type, collection, action, cache_key, start, end in request_plan:
+                    if not self.enabled_stream_types[stream_type]:
+                        print(f"Skipping disabled {stream_type} {collection}")
+                        continue
 
-                    if cached_data.get('LIVE categories', 0):
-                        print("Getting LIVE categories from cache")
-                        categories_per_stream_type['LIVE'] = cached_data['LIVE categories']
-
-                        #Notify user that data is fetched from cache file
-                        # self.signals.show_info_msg.emit('Getting IPTV data from cache', 
-                        #     "Couldn't get Live TV categories from IPTV provider.\n"
-                        #     "Please check your internet connection or if IPTV server is still online.\n"
-                        #     "Fortunately, Live TV categories could be loaded from cache.")
-                        print("Failed fetching Live TV categories. Got them from cache.")
-                    else:
-                        #Display error msg that data fetching failed
-                        # self.signals.show_error_msg.emit('Failed fetching data from IPTV provider', 
-                        #     "Couldn't get Live TV categories from IPTV provider.\n"
-                        #     "Please check your internet connection or if IPTV server is still online.")
-                        print("Failed fetching Live TV categories")
-
-                if self.fetch_vods:
-                    print("Fetching Movies categories")
-                    self.signals.progress_bar.emit(10, 20, "Fetching VOD Categories")
+                    label = f"{stream_type} {collection}"
+                    print(f"Fetching {label}")
+                    self.signals.progress_bar.emit(start, end, f"Fetching {label}")
                     try:
-                        params['action'] = 'get_vod_categories'
-                        movies_category_resp = requests.get(host_url, params=params, headers=headers, timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT))
-                        movies_category_resp.raise_for_status()  #Raises HTTP error is status is 4xx or 5xx
-
-                        categories_per_stream_type['Movies'] = movies_category_resp.json()
+                        params['action'] = action
+                        response = requests.get(
+                            host_url,
+                            params=params,
+                            headers=headers,
+                            timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT)
+                        )
+                        response.raise_for_status()
+                        result = response.json()
                     except Exception as e:
-                        print(f"failed fetching VOD categories: {e}")
+                        print(f"Failed fetching {label}: {e}")
+                        result = cached_data.get(cache_key, [])
+                        if result:
+                            print(f"Loaded {label} from cache")
 
-                        if cached_data.get('Movies categories', 0):
-                            print("Getting Movies categories from cache")
-                            categories_per_stream_type['Movies'] = cached_data['Movies categories']
-
-                            #Notify user that data is fetched from cache file
-                            # self.signals.show_info_msg.emit('Getting IPTV data from cache', 
-                            #     "Couldn't get Movies categories from IPTV provider.\n"
-                            #     "Please check your internet connection or if IPTV server is still online.\n"
-                            #     "Fortunately, Movies categories could be loaded from cache.")
-                            print("Failed fetching Movies categories. Got them from cache.")
-                        else:
-                            #Display error msg that data fetching failed
-                            # self.signals.show_error_msg.emit('Failed fetching data from IPTV provider', 
-                            #     "Couldn't get Movies categories from IPTV provider.\n"
-                            #     "Please check your internet connection or if IPTV server is still online.")
-                            print("Failed fetching Movies categories")
-
-                if self.fetch_vods:
-                    print("Fetching Series categories")
-                    self.signals.progress_bar.emit(20, 30, "Fetching Series Categories")
-                    try:
-                        params['action'] = 'get_series_categories'
-                        series_category_resp = requests.get(host_url, params=params, headers=headers, timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT))
-                        series_category_resp.raise_for_status()  #Raises HTTP error is status is 4xx or 5xx
-
-                        categories_per_stream_type['Series'] = series_category_resp.json()
-                    except Exception as e:
-                        print(f"failed fetching Series categories: {e}")
-
-                        if cached_data.get('Series categories', 0):
-                            print("Getting Series categories from cache")
-                            categories_per_stream_type['Series'] = cached_data['Series categories']
-
-                            #Notify user that data is fetched from cache file
-                            # self.signals.show_info_msg.emit('Getting IPTV data from cache', 
-                            #     "Couldn't get Series categories from IPTV provider.\n"
-                            #     "Please check your internet connection or if IPTV server is still online.\n"
-                            #     "Fortunately, Series categories could be loaded from cache.")
-                            print("Failed fetching Series categories. Got them from cache.")
-                        else:
-                            #Display error msg that data fetching failed
-                            # self.signals.show_error_msg.emit('Failed fetching data from IPTV provider', 
-                            #     "Couldn't get Series categories from IPTV provider.\n"
-                            #     "Please check your internet connection or if IPTV server is still online.")
-                            print("Failed fetching Series categories")
-
-                print("Fetching Live TV streaming data")
-                #Get all streaming data
-                self.signals.progress_bar.emit(30, 40, "Fetching LIVE Streaming data")
-                try:
-                    params['action'] = 'get_live_streams'
-                    live_streams_resp = requests.get(host_url, params=params, headers=headers, timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT))
-                    live_streams_resp.raise_for_status()  #Raises HTTP error is status is 4xx or 5xx
-
-                    entries_per_stream_type['LIVE'] = live_streams_resp.json()
-                except Exception as e:
-                    print(f"failed fetching LIVE streams: {e}")
-
-                    if cached_data.get('LIVE', 0):
-                        print("Getting LIVE streams from cache")
-                        entries_per_stream_type['LIVE'] = cached_data['LIVE']
-
-                        #Notify user that data is fetched from cache file
-                        # self.signals.show_info_msg.emit('Getting IPTV data from cache', 
-                        #     "Couldn't get Live TV streams from IPTV provider.\n"
-                        #     "Please check your internet connection or if IPTV server is still online.\n"
-                        #     "Fortunately, Live TV streams could be loaded from cache.")
-                        print("Failed fetching Live TV streams. Got them from cache.")
-                    else:
-                        #Display error msg that data fetching failed
-                        # self.signals.show_error_msg.emit('Failed fetching data from IPTV provider', 
-                        #     "Couldn't get Live TV streams from IPTV provider.\n"
-                        #     "Please check your internet connection or if IPTV server is still online.")
-                        print("Failed fetching Live TV streams")
-
-                if self.fetch_vods:
-                    print("Fetching Movies streaming data")
-                    self.signals.progress_bar.emit(40, 60, "Fetching VOD Streaming data")
-                    try:
-                        params['action'] = 'get_vod_streams'
-                        movies_streams_resp = requests.get(host_url, params=params, headers=headers, timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT))
-                        movies_streams_resp.raise_for_status()  #Raises HTTP error is status is 4xx or 5xx
-
-                        entries_per_stream_type['Movies'] = movies_streams_resp.json()
-                    except Exception as e:
-                        print(f"failed fetching VOD streams: {e}")
-
-                        if cached_data.get('Movies', 0):
-                            print("Getting Movies streams from cache")
-                            entries_per_stream_type['Movies'] = cached_data['Movies']
-
-                            #Notify user that data is fetched from cache file
-                            # self.signals.show_info_msg.emit('Getting IPTV data from cache', 
-                            #     "Couldn't get Movies streams from IPTV provider.\n"
-                            #     "Please check your internet connection or if IPTV server is still online.\n"
-                            #     "Fortunately, Movies streams could be loaded from cache.")
-                            print("Failed fetching Movies streams. Got them from cache.")
-                        else:
-                            #Display error msg that data fetching failed
-                            # self.signals.show_error_msg.emit('Failed fetching data from IPTV provider', 
-                            #     "Couldn't get Movies streams from IPTV provider.\n"
-                            #     "Please check your internet connection or if IPTV server is still online.")
-                            print("Failed fetching Live TV streams")
-
-                if self.fetch_vods:
-                    print("Fetching Series streaming data")
-                    self.signals.progress_bar.emit(60, 80, "Fetching Series Streaming data")
-                    try:
-                        params['action'] = 'get_series'
-                        series_streams_resp = requests.get(host_url, params=params, headers=headers, timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT))
-                        series_streams_resp.raise_for_status()  #Raises HTTP error is status is 4xx or 5xx
-
-                        entries_per_stream_type['Series'] = series_streams_resp.json()
-                    except Exception as e:
-                        print(f"failed fetching Series streams: {e}")
-
-                        if cached_data.get('Series', 0):
-                            print("Getting Series streams from cache")
-                            entries_per_stream_type['Series'] = cached_data['Series']
-
-                            #Notify user that data is fetched from cache file
-                            # self.signals.show_info_msg.emit('Getting IPTV data from cache', 
-                            #     "Couldn't get Series streams from IPTV provider.\n"
-                            #     "Please check your internet connection or if IPTV server is still online.\n"
-                            #     "Fortunately, Series streams could be loaded from cache.")
-                            print("Failed fetching Series streams. Got them from cache.")
-                        else:
-                            #Display error msg that data fetching failed
-                            # self.signals.show_error_msg.emit('Failed fetching data from IPTV provider', 
-                            #     "Couldn't get Series streams from IPTV provider.\n"
-                            #     "Please check your internet connection or if IPTV server is still online.")
-                            print("Failed fetching Series streams")
+                    destination = (
+                        categories_per_stream_type
+                        if collection == 'categories'
+                        else entries_per_stream_type
+                    )
+                    destination[stream_type] = result
 
                 print("going to create cached data")
 
-                all_cached_data = json.dumps({
-                        'LIVE categories': categories_per_stream_type['LIVE'],
-                        'Movies categories': categories_per_stream_type['Movies'],
-                        'Series categories': categories_per_stream_type['Series'],
-                        'LIVE': entries_per_stream_type['LIVE'],
-                        'Movies': entries_per_stream_type['Movies'],
-                        'Series': entries_per_stream_type['Series']
-                    }, 
-                    indent=4)
+                # Preserve cached collections for disabled content. Disabling Movies,
+                # for example, must not erase its useful fallback data from disk.
+                cache_to_write = dict(cached_data)
+                for stream_type in ('LIVE', 'Movies', 'Series'):
+                    if self.enabled_stream_types[stream_type]:
+                        cache_to_write[f'{stream_type} categories'] = (
+                            categories_per_stream_type[stream_type]
+                        )
+                        cache_to_write[stream_type] = entries_per_stream_type[stream_type]
+
+                all_cached_data = json.dumps(cache_to_write, indent=4)
 
                 with open(self.parent.cache_file, 'w') as cache_file:
                     cache_file.write(all_cached_data)

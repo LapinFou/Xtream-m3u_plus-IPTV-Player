@@ -268,8 +268,12 @@ class IPTVPlayerApp(QMainWindow):
             'Episodes': []
         }
 
-        # Whether to request the VODs or not
-        self.vods_enabled = True
+        # Each content type can be hidden and omitted from provider requests.
+        self.content_enabled = {
+            'LIVE': True,
+            'Movies': True,
+            'Series': True
+        }
 
         #Create search bar dicts
         self.category_search_bars   = {}
@@ -555,28 +559,28 @@ class IPTVPlayerApp(QMainWindow):
         self.tab_widget = QTabWidget()
 
         #Create tabs
-        home_tab        = QWidget()
-        live_tab        = QWidget()
-        movies_tab      = QWidget()
-        series_tab      = QWidget()
-        favorites_tab   = QWidget()
-        info_tab        = QWidget()
-        settings_tab    = QWidget()
+        home_tab          = QWidget()
+        self.live_tab     = QWidget()
+        self.movies_tab   = QWidget()
+        self.series_tab   = QWidget()
+        favorites_tab     = QWidget()
+        info_tab          = QWidget()
+        settings_tab      = QWidget()
 
         #Create layouts for tabs
         self.home_tab_layout        = QVBoxLayout(home_tab)
-        self.live_tab_layout        = QVBoxLayout(live_tab)
-        self.movies_tab_layout      = QVBoxLayout(movies_tab)
-        self.series_tab_layout      = QVBoxLayout(series_tab)
+        self.live_tab_layout        = QVBoxLayout(self.live_tab)
+        self.movies_tab_layout      = QVBoxLayout(self.movies_tab)
+        self.series_tab_layout      = QVBoxLayout(self.series_tab)
         self.favorites_tab_layout   = QGridLayout(favorites_tab)
         self.info_tab_layout        = QVBoxLayout(info_tab)
         self.settings_layout        = QGridLayout(settings_tab)
 
         #Add created tabs to tab widget with their names
         # self.tab_widget.addTab(home_tab,        self.home_icon,         "Home")
-        self.tab_widget.addTab(live_tab,        self.live_icon,         "LIVE")
-        self.tab_widget.addTab(movies_tab,      self.movies_icon,       "Movies")
-        self.tab_widget.addTab(series_tab,      self.series_icon,       "Series")
+        self.tab_widget.addTab(self.live_tab,   self.live_icon,         "LIVE")
+        self.tab_widget.addTab(self.movies_tab, self.movies_icon,       "Movies")
+        self.tab_widget.addTab(self.series_tab, self.series_icon,       "Series")
         # self.tab_widget.addTab(favorites_tab,   self.favorites_icon,    "Favorites")
         self.tab_widget.addTab(info_tab,        self.info_icon,         "Info")
         self.tab_widget.addTab(settings_tab,    self.settings_icon,     "Settings")
@@ -1022,9 +1026,21 @@ class IPTVPlayerApp(QMainWindow):
         self.player_group_layout.addWidget(self.current_player_label, 2, 0, 1, 3)
         self.player_group_layout.setColumnStretch(1, 1)
 
-        self.vods_enabled_checkbox = QCheckBox("VODs enabled")
-        self.vods_enabled_checkbox.setToolTip("Load the Movies/Series tabs for the IPTV account")
-        self.vods_enabled_checkbox.stateChanged.connect(self.toggleVODs)
+        self.content_group_box = QGroupBox("Content")
+        self.content_group_layout = QHBoxLayout(self.content_group_box)
+        self.content_checkboxes = {}
+        for stream_type in ('LIVE', 'Movies', 'Series'):
+            checkbox = QCheckBox(stream_type)
+            checkbox.setToolTip(
+                f"Show the {stream_type} tab and request its data on the next account load"
+            )
+            checkbox.stateChanged.connect(
+                lambda state, selected_type=stream_type:
+                self.toggleContentType(selected_type, state)
+            )
+            self.content_checkboxes[stream_type] = checkbox
+            self.content_group_layout.addWidget(checkbox)
+        self.content_group_layout.addStretch()
 
         self.keep_on_top_checkbox = QCheckBox("Keep on top")
         self.keep_on_top_checkbox.setToolTip("Keep the application on top of all windows")
@@ -1063,7 +1079,7 @@ class IPTVPlayerApp(QMainWindow):
         #Add widgets to settings tab layout
         self.settings_layout.addWidget(self.address_book_button,                            0, 0, 1, 2)
         self.settings_layout.addWidget(self.player_group_box,                               1, 0, 1, 2)
-        self.settings_layout.addWidget(self.vods_enabled_checkbox,                          2, 0)
+        self.settings_layout.addWidget(self.content_group_box,                              2, 0, 1, 2)
         self.settings_layout.addWidget(self.keep_on_top_checkbox,                           3, 0)
         self.settings_layout.addWidget(QLabel("Default sorting order: "),                   4, 0)
         self.settings_layout.addWidget(self.default_sorting_order_box,                      4, 1)
@@ -1090,7 +1106,7 @@ class IPTVPlayerApp(QMainWindow):
         else:
             self.current_user_agent = Threadpools.DEFAULT_USER_AGENT_HEADER
 
-    def loadDefaultVODs(self):
+    def loadDefaultContent(self):
         #Read userdata config file
         config = configparser.ConfigParser()
         try:
@@ -1098,21 +1114,47 @@ class IPTVPlayerApp(QMainWindow):
         except (configparser.Error, UnicodeDecodeError):
             config = configparser.ConfigParser()
 
-        #Check if defined in config. Otherwise set to default
-        if config.has_option('VOD', 'enabled'):
-            self.vods_enabled = (config['VOD']['enabled'] == 'True')
-        else:
-            self.vods_enabled = True
+        # Prefer the new independent values. An existing VOD preference remains a
+        # migration fallback for Movies and Series, so current users keep their choice.
+        def read_boolean(section, option, fallback):
+            try:
+                return config.getboolean(section, option, fallback=fallback)
+            except (ValueError, configparser.Error):
+                return fallback
 
-        #Update tabs to match config
-        self.tab_widget.setTabEnabled(1, self.vods_enabled)
-        self.tab_widget.setTabEnabled(2, self.vods_enabled)
-
-        #Update checkbox to match config
-        if self.vods_enabled:
-            self.vods_enabled_checkbox.setCheckState(Qt.Checked)
+        if config.has_section('Content'):
+            for stream_type in self.content_enabled:
+                self.content_enabled[stream_type] = read_boolean(
+                    'Content', stream_type, True
+                )
         else:
-            self.vods_enabled_checkbox.setCheckState(Qt.Unchecked)
+            legacy_vods_enabled = read_boolean('VOD', 'enabled', True)
+            self.content_enabled = {
+                'LIVE': True,
+                'Movies': legacy_vods_enabled,
+                'Series': legacy_vods_enabled
+            }
+
+        self._applyContentVisibility()
+
+        # Loading preferences must not trigger three redundant writes to userdata.ini.
+        for stream_type, checkbox in self.content_checkboxes.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(self.content_enabled[stream_type])
+            checkbox.blockSignals(False)
+
+    def _applyContentVisibility(self):
+        """Show only enabled content tabs while keeping Info and Settings available."""
+        tab_by_stream_type = {
+            'LIVE': self.live_tab,
+            'Movies': self.movies_tab,
+            'Series': self.series_tab
+        }
+        for stream_type, tab in tab_by_stream_type.items():
+            self.tab_widget.setTabVisible(
+                self.tab_widget.indexOf(tab),
+                self.content_enabled[stream_type]
+            )
 
     def openNetworkSettings(self):
         """Open the modal editor after all persisted network values are loaded."""
@@ -1312,8 +1354,8 @@ class IPTVPlayerApp(QMainWindow):
         #Load default user agent
         self.loadDefaultUserAgent()
 
-        #Load if VODs enabled
-        self.loadDefaultVODs()
+        #Load independent LIVE, Movies, and Series availability
+        self.loadDefaultContent()
 
         #Load default auto update checker
         self.loadDefaultAutoUpdate()
@@ -1494,18 +1536,25 @@ class IPTVPlayerApp(QMainWindow):
 
         self._applyStreamStatusVisibility()
 
-    def toggleVODs(self, state):
-        checked = bool(state)
-
-        self.vods_enabled = checked
-        self.tab_widget.setTabEnabled(1, checked)
-        self.tab_widget.setTabEnabled(2, checked)
+    def toggleContentType(self, stream_type, state):
+        """Persist one content choice and immediately update tab visibility."""
+        self.content_enabled[stream_type] = bool(state)
+        self._applyContentVisibility()
 
         config = configparser.ConfigParser()
-        config.read(self.user_data_file)
-        config['VOD'] = {'enabled': checked}
-        with open(self.user_data_file, 'w') as config_file:
-            config.write(config_file)
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+        config['Content'] = {
+            key: str(enabled)
+            for key, enabled in self.content_enabled.items()
+        }
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+        except OSError as e:
+            print(f"Could not write user data file: {e}")
     
     def toggle_cache_on_startup(self, state):
         if state == Qt.Checked:
@@ -1633,7 +1682,16 @@ class IPTVPlayerApp(QMainWindow):
         self.set_progress_bar(0, "Going to fetch data...")
 
     def fetch_data_thread(self):
-        dataWorker = FetchDataWorker(self.server, self.username, self.password, self.live_url_format, self.movie_url_format, self.series_url_format, self, self.vods_enabled)
+        dataWorker = FetchDataWorker(
+            self.server,
+            self.username,
+            self.password,
+            self.live_url_format,
+            self.movie_url_format,
+            self.series_url_format,
+            self,
+            self.content_enabled
+        )
         dataWorker.signals.finished.connect(self.process_data)
         dataWorker.signals.error.connect(self.on_fetch_data_error)
         dataWorker.signals.progress_bar.connect(self.animate_progress)
@@ -1712,8 +1770,8 @@ class IPTVPlayerApp(QMainWindow):
             self.category_list_widgets[stream_type].clear()
             self.streaming_list_widgets[stream_type].clear()
 
-            #Skip VODs if option enabled
-            if self.vods_enabled is False and (stream_type == 'Movies' or stream_type == 'Series'):
+            # Disabled types contain no newly requested data and stay out of the UI.
+            if not self.content_enabled[stream_type]:
                 continue
 
             #Fill currently loaded streams with current stream data
