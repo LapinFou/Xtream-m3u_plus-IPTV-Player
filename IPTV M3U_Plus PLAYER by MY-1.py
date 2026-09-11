@@ -15,7 +15,8 @@ import xml.etree.ElementTree as ET
 from PyQt5.QtGui import QIcon, QFont, QImage, QPixmap, QColor, QDesktopServices, QIntValidator, QPalette
 from PyQt5.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QObject, pyqtSignal, 
-    QRunnable, pyqtSlot, QThreadPool, QModelIndex, QAbstractItemModel, QVariant, QUrl
+    QRunnable, pyqtSlot, QThreadPool, QModelIndex, QAbstractItemModel, QVariant,
+    QUrl, QByteArray
 )
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (
@@ -32,7 +33,7 @@ from CustomPyQtWidgets import LiveInfoBox, MovieInfoBox, SeriesInfoBox, Embedded
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher
 
-CURRENT_VERSION = "V2.01.01"
+CURRENT_VERSION = "V2.01.02"
 
 # CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
 # Increment the schema only when a release changes persisted data and add a matching,
@@ -358,7 +359,7 @@ class IPTVPlayerApp(QMainWindow):
         self.loadDataAtStartup()
 
         #Create live tv tab splitter
-        live_splitter = QSplitter(Qt.Horizontal)
+        self.live_splitter = QSplitter(Qt.Horizontal)
 
         # Column 0 widget (category)
         live_category_container = QWidget()
@@ -390,23 +391,23 @@ class IPTVPlayerApp(QMainWindow):
         live_info_box_container.setMinimumWidth(300)
 
         # Add widgets to splitter
-        live_splitter.addWidget(live_category_container)
-        live_splitter.addWidget(live_streaming_container)
-        live_splitter.addWidget(live_info_box_container)
+        self.live_splitter.addWidget(live_category_container)
+        self.live_splitter.addWidget(live_streaming_container)
+        self.live_splitter.addWidget(live_info_box_container)
 
         # Stretch ratios (initial splitter sizes)
-        live_splitter.setSizes([200, 200, 300])  # Initial widths
+        self.live_splitter.setSizes([200, 200, 300])  # Initial widths
 
-        live_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
-        live_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
-        live_splitter.setCollapsible(2, False)  # prevent collapsing column 2
+        self.live_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
+        self.live_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
+        self.live_splitter.setCollapsible(2, False)  # prevent collapsing column 2
 
         # Add splitter to live tab layout
-        self.live_tab_layout.addWidget(live_splitter)
+        self.live_tab_layout.addWidget(self.live_splitter)
 
 
         #Create movies tab splitter
-        movies_splitter = QSplitter(Qt.Horizontal)
+        self.movies_splitter = QSplitter(Qt.Horizontal)
 
         # Column 0 widget (category)
         movies_category_container = QWidget()
@@ -438,23 +439,23 @@ class IPTVPlayerApp(QMainWindow):
         movies_info_box_container.setMinimumWidth(350)
 
         # Add widgets to splitter
-        movies_splitter.addWidget(movies_category_container)
-        movies_splitter.addWidget(movies_streaming_container)
-        movies_splitter.addWidget(movies_info_box_container)
+        self.movies_splitter.addWidget(movies_category_container)
+        self.movies_splitter.addWidget(movies_streaming_container)
+        self.movies_splitter.addWidget(movies_info_box_container)
 
         # Stretch ratios (initial splitter sizes)
-        movies_splitter.setSizes([200, 200, 300])  # Initial widths
+        self.movies_splitter.setSizes([200, 200, 300])  # Initial widths
 
-        movies_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
-        movies_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
-        movies_splitter.setCollapsible(2, False)  # prevent collapsing column 2
+        self.movies_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
+        self.movies_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
+        self.movies_splitter.setCollapsible(2, False)  # prevent collapsing column 2
 
         # Add splitter to movies tab layout
-        self.movies_tab_layout.addWidget(movies_splitter)
+        self.movies_tab_layout.addWidget(self.movies_splitter)
 
 
         #Create series tab splitter
-        series_splitter = QSplitter(Qt.Horizontal)
+        self.series_splitter = QSplitter(Qt.Horizontal)
 
         # Column 0 widget (category)
         series_category_container = QWidget()
@@ -486,19 +487,19 @@ class IPTVPlayerApp(QMainWindow):
         series_info_box_container.setMinimumWidth(350)
 
         # Add widgets to splitter
-        series_splitter.addWidget(series_category_container)
-        series_splitter.addWidget(series_streaming_container)
-        series_splitter.addWidget(series_info_box_container)
+        self.series_splitter.addWidget(series_category_container)
+        self.series_splitter.addWidget(series_streaming_container)
+        self.series_splitter.addWidget(series_info_box_container)
 
         # Stretch ratios (initial splitter sizes)
-        series_splitter.setSizes([200, 200, 300])  # Initial widths
+        self.series_splitter.setSizes([200, 200, 300])  # Initial widths
 
-        series_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
-        series_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
-        series_splitter.setCollapsible(2, False)  # prevent collapsing column 2
+        self.series_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
+        self.series_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
+        self.series_splitter.setCollapsible(2, False)  # prevent collapsing column 2
 
         # Add splitter to series tab layout
-        self.series_tab_layout.addWidget(series_splitter)
+        self.series_tab_layout.addWidget(self.series_splitter)
         
         #Add iptv info text to info tab
         self.info_tab_layout.addWidget(self.iptv_info_text)
@@ -513,6 +514,102 @@ class IPTVPlayerApp(QMainWindow):
         #Add everything to the main_layout
         main_layout.addWidget(self.tab_widget)
         main_layout.addWidget(self.progress_bar)
+
+        # Restore only after every splitter and tab exists. The saved geometry also
+        # carries the maximized state, while the splitter states preserve the three
+        # independently resized columns in each content tab.
+        self.restoreWindowLayout()
+
+    def _encoded_widget_state(self, state):
+        """Encode Qt's binary geometry/state payload for safe INI storage."""
+        return bytes(state.toBase64()).decode('ascii')
+
+    def _decoded_widget_state(self, encoded_state):
+        """Decode a persisted Qt state, returning an empty payload if invalid."""
+        try:
+            return QByteArray.fromBase64(encoded_state.encode('ascii'))
+        except (AttributeError, UnicodeEncodeError):
+            return QByteArray()
+
+    def restoreWindowLayout(self):
+        """Restore window geometry, active tab, and per-tab column widths."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError) as e:
+            print(f"Could not restore window layout: {e}")
+            return
+
+        if 'Window' not in config:
+            return
+
+        window_config = config['Window']
+        encoded_geometry = window_config.get('geometry', '')
+        if encoded_geometry:
+            self.restoreGeometry(self._decoded_widget_state(encoded_geometry))
+            self._ensure_window_is_visible()
+
+        splitters = {
+            'live_splitter': self.live_splitter,
+            'movies_splitter': self.movies_splitter,
+            'series_splitter': self.series_splitter
+        }
+        for setting_name, splitter in splitters.items():
+            encoded_state = window_config.get(setting_name, '')
+            if encoded_state:
+                splitter.restoreState(self._decoded_widget_state(encoded_state))
+
+        active_tab = window_config.get('active_tab', '')
+        for tab_index in range(self.tab_widget.count()):
+            if self.tab_widget.tabText(tab_index) == active_tab:
+                self.tab_widget.setCurrentIndex(tab_index)
+                break
+
+    def _ensure_window_is_visible(self):
+        """Move a restored window back on-screen after monitor layout changes."""
+        window_geometry = self.frameGeometry()
+        if any(
+            window_geometry.intersects(screen.availableGeometry())
+            for screen in QApplication.screens()
+        ):
+            return
+
+        primary_screen = QApplication.primaryScreen()
+        if primary_screen is None:
+            return
+
+        available = primary_screen.availableGeometry()
+        self.setWindowState(Qt.WindowNoState)
+        self.resize(min(1300, available.width()), min(900, available.height()))
+        centered_geometry = self.frameGeometry()
+        centered_geometry.moveCenter(available.center())
+        self.move(centered_geometry.topLeft())
+
+    def saveWindowLayout(self):
+        """Persist durable UI layout preferences in userdata.ini."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+
+        config['Window'] = {
+            'geometry': self._encoded_widget_state(self.saveGeometry()),
+            'live_splitter': self._encoded_widget_state(self.live_splitter.saveState()),
+            'movies_splitter': self._encoded_widget_state(self.movies_splitter.saveState()),
+            'series_splitter': self._encoded_widget_state(self.series_splitter.saveState()),
+            'active_tab': self.tab_widget.tabText(self.tab_widget.currentIndex())
+        }
+
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+        except OSError as e:
+            print(f"Could not save window layout: {e}")
+
+    def closeEvent(self, event):
+        self.saveWindowLayout()
+        super().closeEvent(event)
 
     def updateUserDataFile(self):
         # Load the configuration file. A corrupted .ini must not crash the app —
