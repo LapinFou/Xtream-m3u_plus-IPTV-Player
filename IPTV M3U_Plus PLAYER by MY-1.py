@@ -34,6 +34,12 @@ from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, 
 
 CURRENT_VERSION = "V2.01.00"
 
+# CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
+# Increment the schema only when a release changes persisted data and add a matching,
+# ordered migration in updateUserDataFile(). It is intentionally independent from
+# CURRENT_VERSION because most application releases do not change persisted data.
+CURRENT_CONFIG_SCHEMA_VERSION = 1
+
 is_windows  = sys.platform.startswith('win')
 is_mac      = sys.platform.startswith('darwin')
 is_linux    = sys.platform.startswith('linux')
@@ -498,31 +504,71 @@ class IPTVPlayerApp(QMainWindow):
                 pass
             return
 
-        # Check if 'Credentials' section exists
-        if 'Credentials' not in config:
-            return
+        if 'Credentials' in config:
+            for account_name, data in config['Credentials'].items():
+                parts = data.split('|')
 
-        for account_name, data in config['Credentials'].items():
-            parts = data.split('|')
+                # Required total length and which fields are the URL-format tail.
+                if data.startswith('manual|'):
+                    required_length = 7  # manual|server|user|pass|live_fmt|movie_fmt|series_fmt
+                elif data.startswith('m3u_plus|'):
+                    required_length = 5  # m3u_plus|url|live_fmt|movie_fmt|series_fmt
+                else:
+                    continue
 
-            # Required total length and which fields are the URL-format tail.
-            if data.startswith('manual|'):
-                required_length = 7  # manual|server|user|pass|live_fmt|movie_fmt|series_fmt+1 leading tag
-            elif data.startswith('m3u_plus|'):
-                required_length = 5  # m3u_plus|url|live_fmt|movie_fmt|series_fmt+1 leading tag
-            else:
-                continue
+                # Append default URL formats for whichever ones are missing at the tail.
+                if len(parts) < required_length:
+                    defaults = [self.default_url_formats['live'],
+                                self.default_url_formats['movie'],
+                                self.default_url_formats['series']]
+                    missing = required_length - len(parts)
+                    # Take the LAST `missing` defaults because missing formats are
+                    # always the trailing fields of the serialized account value.
+                    parts += defaults[-missing:]
+                    config['Credentials'][account_name] = "|".join(parts)
 
-            # Append default URL formats for whichever ones are missing at the tail.
-            if len(parts) < required_length:
-                defaults = [self.default_url_formats['live'],
-                            self.default_url_formats['movie'],
-                            self.default_url_formats['series']]
-                missing = required_length - len(parts)
-                # Take the LAST `missing` defaults (the tail of the list), not the first —
-                # the first defaults that exist in `parts` are for live/movie, missing ones are at the end.
-                parts += defaults[-missing:]
-                config['Credentials'][account_name] = "|".join(parts)
+        # Migration contract for future configuration changes:
+        #   1. Increment CURRENT_CONFIG_SCHEMA_VERSION.
+        #   2. Add an ordered `if stored_schema_version < N` block below.
+        #   3. Make the migration safe to run more than once and preserve user choices.
+        # The stored marker represents the latest completed migration. It is written
+        # only after all migration blocks have executed and the configuration is ready.
+        try:
+            stored_schema_version = config.getint(
+                'Application', 'config_schema_version', fallback=0
+            )
+        except (ValueError, configparser.Error):
+            stored_schema_version = 0
+
+        if stored_schema_version < 1:
+            # Schema 1 replaces the combined VOD switch with independent content
+            # switches. Reuse the legacy value for Movies and Series so migration
+            # never changes an existing user's provider traffic preference.
+            try:
+                legacy_vods_enabled = config.getboolean('VOD', 'enabled', fallback=True)
+            except (ValueError, configparser.Error):
+                legacy_vods_enabled = True
+
+            if 'Content' not in config:
+                config['Content'] = {}
+            content = config['Content']
+            if 'LIVE' not in content:
+                content['LIVE'] = 'True'
+            if 'Movies' not in content:
+                content['Movies'] = str(legacy_vods_enabled)
+            if 'Series' not in content:
+                content['Series'] = str(legacy_vods_enabled)
+
+        if 'Application' not in config:
+            config['Application'] = {}
+        # Early V2.01 test builds briefly stored the application version here. Remove
+        # that redundant key because CURRENT_VERSION already drives update checks.
+        config.remove_option('Application', 'last_run_version')
+        # Preserve a newer schema number if this build opens a configuration that
+        # was previously written by a future application version.
+        config['Application']['config_schema_version'] = str(
+            max(stored_schema_version, CURRENT_CONFIG_SCHEMA_VERSION)
+        )
 
         try:
             with open(self.user_data_file, 'w') as config_file:

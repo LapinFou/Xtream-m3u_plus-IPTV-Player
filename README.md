@@ -57,6 +57,37 @@ Download the latest version here: [Latest releases](https://github.com/Youri666/
 - **Improve startup loading time:** Improve loading time at startup by optionally loading the IPTV data from cache.
 - **Dark theme**
 
+## Configuration migrations
+
+`userdata.ini` records the version of its persisted-data schema:
+
+```ini
+[Application]
+config_schema_version = 1
+```
+
+`config_schema_version` identifies the structure and meaning of the persisted data.
+When a major or minor update changes that structure, the application can compare this
+number with `CURRENT_CONFIG_SCHEMA_VERSION` and apply every missing migration in order.
+For example, schema 1 converts the former combined `VOD` option into independent LIVE,
+Movies, and Series options while preserving the user's previous choice.
+
+This value is deliberately separate from `CURRENT_VERSION`. The application version
+is already compiled into the executable and is used by the GitHub update checker;
+storing it again in `userdata.ini` would be redundant. Most application releases do
+not change the configuration schema.
+
+When adding a configuration migration:
+
+1. Increment `CURRENT_CONFIG_SCHEMA_VERSION`.
+2. Add an ordered `if stored_schema_version < N` block to `updateUserDataFile()`.
+3. Make the migration safe to run repeatedly and preserve existing user preferences.
+4. Update the stored schema marker only after the migration blocks have completed.
+
+The loader preserves a schema number newer than the current application understands.
+This prevents an older build from incorrectly marking a future configuration as an
+older schema.
+
 <details>
 <summary><h1><strong>FAQ</strong></h1></summary>
 
