@@ -32,10 +32,15 @@ CONNECTION_HEADER           = "Keep-Alive"
 CONTENT_HEADER              = "gzip, deflate"
 DEFAULT_USER_AGENT_HEADER   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 
-#Default timeout values
-CONNECTION_TIMEOUT  = 3
-READ_TIMEOUT        = 30
-LIVE_STATUS_TIMEOUT = 7
+# Default network values. LIVE status retries are additional attempts, so the
+# default value of 2 allows up to 3 probes including the initial request.
+CONNECTION_TIMEOUT       = 3
+READ_TIMEOUT             = 30
+LIVE_STATUS_TIMEOUT      = 7
+LIVE_STATUS_RETRIES      = 2
+LIVE_STATUS_RETRY_DELAY  = 0.5
+LIVE_STATUS_CHUNK_SIZE   = 4096
+MAX_LIVE_STATUS_RETRIES  = 10
 
 class FetchDataWorkerSignals(QObject):
     finished        = pyqtSignal(dict, dict, dict)
@@ -724,42 +729,98 @@ class OnlineWorker(QRunnable):
 
     @pyqtSlot()
     def run(self):
-        try:
-            #Create header
-            # Fall back to the default UA when the user hasn't picked one — sending an
-            # empty User-Agent makes some providers return 403 or empty category lists
-            # (related to issues #69 and #10).
-            ua = (self.parent.current_user_agent or "").strip() or DEFAULT_USER_AGENT_HEADER
-            headers = {
-                "Connection": CONNECTION_HEADER,
-                "Accept-Encoding": CONTENT_HEADER,
-                "User-Agent": ua
-            }
+        """Probe a LIVE stream and emit one final status after all retries."""
 
-            #Requesting stream playlist data
-            response = requests.get(self.url, headers=headers, timeout=(CONNECTION_TIMEOUT, LIVE_STATUS_TIMEOUT))
+        # Fall back to the default UA when the user has not picked one. Sending an
+        # empty User-Agent makes some providers return 403 or empty responses.
+        ua = (self.parent.current_user_agent or "").strip() or DEFAULT_USER_AGENT_HEADER
+        headers = {
+            "Connection": CONNECTION_HEADER,
+            "Accept-Encoding": CONTENT_HEADER,
+            "User-Agent": ua
+        }
+
+        # Clamp the global value because userdata.ini can be edited manually and
+        # therefore cannot be trusted to respect the GUI validator.
+        retry_count = max(0, min(int(LIVE_STATUS_RETRIES), MAX_LIVE_STATUS_RETRIES))
+        best_status = False
+        received_response = False
+        last_error = None
+
+        # Do not emit a red state between attempts. A transient provider failure
+        # should not make the traffic light flicker before a later probe succeeds.
+        for attempt in range(retry_count + 1):
+            try:
+                stream_status = self.requestStatus(headers)
+                received_response = True
+
+                # A confirmed successful probe is definitive and needs no retry.
+                if stream_status is True:
+                    self.signals.finished.emit(self.stream_id, str(stream_status))
+                    return
+
+                # Preserve "Maybe" over False when the provider reports a stream
+                # that appears to be starting, even if a later retry fails.
+                if stream_status == "Maybe":
+                    best_status = "Maybe"
+            except Exception as e:
+                last_error = e
+
+            if attempt < retry_count:
+                time.sleep(LIVE_STATUS_RETRY_DELAY)
+
+        # HTTP responses produce a final red/amber status. The unknown state is
+        # reserved for the case where every attempt failed at the network layer.
+        if received_response:
+            self.signals.finished.emit(self.stream_id, str(best_status))
+        else:
+            self.signals.error.emit(str(last_error))
+
+    def requestStatus(self, headers):
+        """Read one small chunk instead of waiting for a continuous stream to end."""
+
+        # Direct .ts streams may never finish. Streaming the response and closing it
+        # after the first 4 KiB proves that bytes are arriving without downloading
+        # the programme itself or holding an extra provider connection open.
+        with requests.get(
+            self.url,
+            headers=headers,
+            timeout=(CONNECTION_TIMEOUT, LIVE_STATUS_TIMEOUT),
+            stream=True
+        ) as response:
             response_code = response.status_code
-            url_data = response.text
+            url_data = response.url
+            received_data = False
 
-            #Determine if stream looks offline or not
-            stream_offline = self.checkStatus(response_code, url_data)
+            if response_code == 200:
+                for chunk in response.iter_content(chunk_size=LIVE_STATUS_CHUNK_SIZE):
+                    if chunk:
+                        received_data = True
+                        url_data += "\n" + chunk.decode("utf-8", errors="ignore")
+                        break
 
-            self.signals.finished.emit(self.stream_id, str(stream_offline))
-        except Exception as e:
-            self.signals.error.emit(str(e))
+                # A successful HTTP response without payload does not prove that the
+                # channel is usable, so treat it as an offline probe.
+                if not received_data:
+                    return False
+
+        return self.checkStatus(response_code, url_data)
 
     def checkStatus(self, response_code, url_data):
         if response_code != 200:  # need HTTP OK status
             return False
 
-        if "offline" in url_data: #some providers use offline.m3u8 as a dummy video file
+        # Provider-generated playlists are not consistent about letter case.
+        normalized_url_data = url_data.lower()
+
+        if "offline" in normalized_url_data: #some providers use offline.m3u8 as a dummy video file
             return False
         
-        if "EXT-X-ENDLIST" in url_data: #m3u file is saying stream is over
+        if "ext-x-endlist" in normalized_url_data: #m3u file is saying stream is over
             return False
         
-        if "#EXT-X-MEDIA-SEQUENCE:0" in url_data:                 #some providers respond with a fresh "Stream starting soon" stream
-            if "_0.ts" in url_data and "_1.ts" not in url_data:   #this technically just means a stream is freshly started, hence the "Maybe" online
-                return "Maybe"                                    #officially, see https://datatracker.ietf.org/doc/html/rfc8216#section-4.3.3.2   
+        if "#ext-x-media-sequence:0" in normalized_url_data:                 #some providers respond with a fresh "Stream starting soon" stream
+            if "_0.ts" in normalized_url_data and "_1.ts" not in normalized_url_data:   #this technically just means a stream is freshly started, hence the "Maybe" online
+                return "Maybe"                                    #officially, see https://datatracker.ietf.org/doc/html/rfc8216#section-4.3.3.2
 
         return True
