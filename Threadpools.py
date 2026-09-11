@@ -32,12 +32,19 @@ CONNECTION_HEADER           = "Keep-Alive"
 CONTENT_HEADER              = "gzip, deflate"
 DEFAULT_USER_AGENT_HEADER   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"
 
-# Default network values. LIVE status retries are additional attempts, so the
-# default value of 2 allows up to 3 probes including the initial request.
-CONNECTION_TIMEOUT       = 3
-READ_TIMEOUT             = 30
-LIVE_STATUS_TIMEOUT      = 7
-LIVE_STATUS_RETRIES      = 2
+# Default network values. Keep immutable defaults separate from the active values
+# so the Advanced network settings dialog can reliably restore factory settings.
+DEFAULT_CONNECTION_TIMEOUT  = 3
+DEFAULT_READ_TIMEOUT         = 30
+DEFAULT_LIVE_STATUS_TIMEOUT  = 7
+DEFAULT_LIVE_STATUS_RETRIES  = 2
+
+# LIVE status retries are additional attempts, so the default value of 2 allows
+# up to 3 probes including the initial request.
+CONNECTION_TIMEOUT       = DEFAULT_CONNECTION_TIMEOUT
+READ_TIMEOUT             = DEFAULT_READ_TIMEOUT
+LIVE_STATUS_TIMEOUT      = DEFAULT_LIVE_STATUS_TIMEOUT
+LIVE_STATUS_RETRIES      = DEFAULT_LIVE_STATUS_RETRIES
 LIVE_STATUS_RETRY_DELAY  = 0.5
 LIVE_STATUS_CHUNK_SIZE   = 4096
 MAX_LIVE_STATUS_RETRIES  = 10

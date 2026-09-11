@@ -40,6 +40,118 @@ is_linux    = sys.platform.startswith('linux')
 
 GITHUB_REPO = "Youri666/Xtream-m3u_plus-IPTV-Player"
 
+
+class NetworkSettingsDialog(QDialog):
+    """Edit all network-related preferences without widening the Settings tab."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent_app = parent
+        self.setWindowTitle("Advanced network settings")
+        self.setModal(True)
+        self.resize(620, 320)
+
+        main_layout = QVBoxLayout(self)
+
+        general_group = QGroupBox("General network")
+        general_form = QFormLayout(general_group)
+
+        self.user_agent_box = QComboBox()
+        self.user_agent_box.addItems(parent.user_agents)
+        self.user_agent_box.setCurrentText(parent.current_user_agent)
+        self.user_agent_box.setToolTip("User-Agent sent with IPTV provider requests")
+
+        self.connection_timeout_spin = self._create_seconds_spinbox(
+            Threadpools.CONNECTION_TIMEOUT,
+            "Maximum time allowed to establish a connection"
+        )
+        self.read_timeout_spin = self._create_seconds_spinbox(
+            Threadpools.READ_TIMEOUT,
+            "Maximum time allowed while waiting for regular response data"
+        )
+
+        general_form.addRow("User-Agent:", self.user_agent_box)
+        general_form.addRow("Connection timeout:", self.connection_timeout_spin)
+        general_form.addRow("Read timeout:", self.read_timeout_spin)
+
+        live_group = QGroupBox("LIVE stream status")
+        live_layout = QVBoxLayout(live_group)
+        self.live_status_checkbox = QCheckBox("Enable LIVE stream status checks")
+        self.live_status_checkbox.setToolTip(
+            "Probe the selected LIVE channel and display its green/red status indicator"
+        )
+        self.live_status_checkbox.setChecked(parent.stream_status_enabled)
+        live_layout.addWidget(self.live_status_checkbox)
+
+        # Put the dependent controls in their own widget so disabling status checks
+        # also grays their labels, while the enabling checkbox remains clickable.
+        self.live_options_widget = QWidget()
+        live_form = QFormLayout(self.live_options_widget)
+        live_form.setContentsMargins(0, 0, 0, 0)
+        self.live_timeout_spin = self._create_seconds_spinbox(
+            Threadpools.LIVE_STATUS_TIMEOUT,
+            "Maximum wait for each LIVE status attempt"
+        )
+        self.live_retries_spin = QSpinBox()
+        self.live_retries_spin.setRange(0, Threadpools.MAX_LIVE_STATUS_RETRIES)
+        self.live_retries_spin.setValue(Threadpools.LIVE_STATUS_RETRIES)
+        self.live_retries_spin.setToolTip(
+            "Number of additional attempts after the initial LIVE status request"
+        )
+        live_form.addRow("Timeout per attempt:", self.live_timeout_spin)
+        live_form.addRow("Additional retries:", self.live_retries_spin)
+        live_layout.addWidget(self.live_options_widget)
+
+        self.live_status_checkbox.toggled.connect(self.live_options_widget.setEnabled)
+        self.live_options_widget.setEnabled(self.live_status_checkbox.isChecked())
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.Save
+            | QDialogButtonBox.Cancel
+            | QDialogButtonBox.RestoreDefaults
+        )
+        self.button_box.accepted.connect(self.save_settings)
+        self.button_box.rejected.connect(self.reject)
+        self.button_box.button(QDialogButtonBox.RestoreDefaults).clicked.connect(
+            self.restore_defaults
+        )
+
+        main_layout.addWidget(general_group)
+        main_layout.addWidget(live_group)
+        main_layout.addWidget(self.button_box)
+
+    @staticmethod
+    def _create_seconds_spinbox(value, tooltip):
+        """Create a consistently bounded timeout editor."""
+        spinbox = QSpinBox()
+        spinbox.setRange(1, 999)
+        spinbox.setSuffix(" s")
+        spinbox.setValue(value)
+        spinbox.setToolTip(tooltip)
+        return spinbox
+
+    def restore_defaults(self):
+        """Restore the documented defaults without closing or saving the dialog."""
+        self.user_agent_box.setCurrentText(Threadpools.DEFAULT_USER_AGENT_HEADER)
+        self.connection_timeout_spin.setValue(Threadpools.DEFAULT_CONNECTION_TIMEOUT)
+        self.read_timeout_spin.setValue(Threadpools.DEFAULT_READ_TIMEOUT)
+        self.live_status_checkbox.setChecked(True)
+        self.live_timeout_spin.setValue(Threadpools.DEFAULT_LIVE_STATUS_TIMEOUT)
+        self.live_retries_spin.setValue(Threadpools.DEFAULT_LIVE_STATUS_RETRIES)
+
+    def save_settings(self):
+        """Apply the complete dialog state as one coherent configuration update."""
+        self.parent_app.applyNetworkSettings(
+            self.user_agent_box.currentText(),
+            self.connection_timeout_spin.value(),
+            self.read_timeout_spin.value(),
+            self.live_timeout_spin.value(),
+            self.live_retries_spin.value(),
+            self.live_status_checkbox.isChecked()
+        )
+        self.accept()
+
+
 class IPTVPlayerApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -930,10 +1042,6 @@ class IPTVPlayerApp(QMainWindow):
         # self.reload_data_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload))
         # self.reload_data_btn.setToolTip("Click this to manually reload the IPTV data.\nNote that this only has effect if \'Startup with cached data\' is checked.")
 
-        self.select_user_agent_box = QComboBox()
-        self.select_user_agent_box.addItems(self.user_agents)
-        self.select_user_agent_box.currentTextChanged.connect(lambda e: self.userAgentSelected(e, self.select_user_agent_box))
-
         self.update_checker = QPushButton("Check for updates")
         self.update_checker.clicked.connect(lambda: self.checkForUpdates(True))
 
@@ -941,48 +1049,16 @@ class IPTVPlayerApp(QMainWindow):
         self.auto_update_checkbox.setToolTip("Automatically check for updates at startup")
         self.auto_update_checkbox.stateChanged.connect(self.toggleAutoUpdate)
 
-        self.stream_status_checkbox = QCheckBox("Enable LIVE stream status checks")
-        self.stream_status_checkbox.setToolTip(
-            "Probe the selected LIVE channel and show its green/red status indicator.\n"
-            "When disabled, the indicator is hidden and no status request is sent."
+        self.advanced_network_button = QPushButton("Advanced network settings…")
+        self.advanced_network_button.setToolTip(
+            "Configure request timeouts, LIVE status checks, retries, and User-Agent"
         )
-        self.stream_status_checkbox.stateChanged.connect(self.toggleStreamStatus)
+        self.advanced_network_button.clicked.connect(self.openNetworkSettings)
 
         self.theme_select_box = QComboBox()
         self.theme_select_box.addItems(["System", "Light", "Dark"])
         self.theme_select_box.setToolTip("Switch between Light, Dark, or follow the OS setting (default).")
         self.theme_select_box.currentTextChanged.connect(self.themeChanged)
-
-        # Validate network settings at entry time. Timeout values must be positive,
-        # while zero retries intentionally means "perform only the initial probe".
-        timeout_validator = QIntValidator(1, 999)
-        retry_validator = QIntValidator(0, Threadpools.MAX_LIVE_STATUS_RETRIES)
-
-        self.set_connection_timeout = QLineEdit()
-        self.set_connection_timeout.setFixedWidth(100)
-        self.set_connection_timeout.setValidator(timeout_validator)
-        self.set_connection_timeout.returnPressed.connect(lambda: self.setNetworkOption(self.set_connection_timeout))
-
-        self.set_read_timeout = QLineEdit()
-        self.set_read_timeout.setFixedWidth(100)
-        self.set_read_timeout.setValidator(timeout_validator)
-        self.set_read_timeout.returnPressed.connect(lambda: self.setNetworkOption(self.set_read_timeout))
-
-        self.set_live_status_timeout = QLineEdit()
-        self.set_live_status_timeout.setFixedWidth(100)
-        self.set_live_status_timeout.setValidator(timeout_validator)
-        self.set_live_status_timeout.setToolTip("Maximum wait for one LIVE status attempt")
-        self.set_live_status_timeout.returnPressed.connect(lambda: self.setNetworkOption(self.set_live_status_timeout))
-
-        self.set_live_status_retries = QLineEdit()
-        self.set_live_status_retries.setFixedWidth(100)
-        self.set_live_status_retries.setValidator(retry_validator)
-        self.set_live_status_retries.setToolTip(
-            "Number of additional attempts after the first failed LIVE status check"
-        )
-        self.set_live_status_retries.returnPressed.connect(
-            lambda: self.setNetworkOption(self.set_live_status_retries)
-        )
 
         #Add widgets to settings tab layout
         self.settings_layout.addWidget(self.address_book_button,                            0, 0, 1, 2)
@@ -993,40 +1069,12 @@ class IPTVPlayerApp(QMainWindow):
         self.settings_layout.addWidget(self.default_sorting_order_box,                      4, 1)
         self.settings_layout.addWidget(self.update_checker,                                 5, 0)
         self.settings_layout.addWidget(self.auto_update_checkbox,                           5, 1)
-        self.settings_layout.addWidget(self.stream_status_checkbox,                        11, 0)
-        self.settings_layout.addWidget(QLabel("Theme: "),                                 13, 0)
-        self.settings_layout.addWidget(self.theme_select_box,                              13, 1)
-
-        #Advanced options
-        self.settings_layout.addWidget(QLabel("Select User-Agent (Advanced option): "),         6, 0)
-        self.settings_layout.addWidget(self.select_user_agent_box,                              6, 1)
-        self.settings_layout.addWidget(QLabel("Set connection timeout (Advanced option): "),    7, 0)
-        self.settings_layout.addWidget(self.set_connection_timeout,                             7, 1)
-        self.settings_layout.addWidget(QLabel("Set read timeout (Advanced option): "),          8, 0)
-        self.settings_layout.addWidget(self.set_read_timeout,                                   8, 1)
-        self.settings_layout.addWidget(QLabel("Set live status timeout per attempt (Advanced option): "), 9, 0)
-        self.settings_layout.addWidget(self.set_live_status_timeout,                            9, 1)
-        self.settings_layout.addWidget(QLabel("Set live status retries (Advanced option): "),  10, 0)
-        self.settings_layout.addWidget(self.set_live_status_retries,                           10, 1)
+        self.settings_layout.addWidget(self.advanced_network_button,                        6, 0, 1, 2)
+        self.settings_layout.addWidget(QLabel("Theme: "),                                  7, 0)
+        self.settings_layout.addWidget(self.theme_select_box,                               7, 1)
 
         # self.settings_layout.addWidget(self.cache_on_startup_checkbox,  2, 0)
         # self.settings_layout.addWidget(self.reload_data_btn,            3, 0)
-
-    def userAgentSelected(self, e, combobox):
-        #Get selected text
-        user_agent = combobox.currentText()
-
-        #Set current user agent
-        self.current_user_agent = user_agent
-
-        #Save selected user agent to userdata
-        config = configparser.ConfigParser()
-        config.read(self.user_data_file)
-
-        config['User-Agent'] = {'user-agent': user_agent}
-
-        with open(self.user_data_file, 'w') as config_file:
-            config.write(config_file)
 
     def loadDefaultUserAgent(self):
         #Read userdata config file
@@ -1041,9 +1089,6 @@ class IPTVPlayerApp(QMainWindow):
             self.current_user_agent = config['User-Agent']['user-agent']
         else:
             self.current_user_agent = Threadpools.DEFAULT_USER_AGENT_HEADER
-
-        #Update combobox to selection
-        self.select_user_agent_box.setCurrentText(self.current_user_agent)
 
     def loadDefaultVODs(self):
         #Read userdata config file
@@ -1069,56 +1114,44 @@ class IPTVPlayerApp(QMainWindow):
         else:
             self.vods_enabled_checkbox.setCheckState(Qt.Unchecked)
 
-    def setNetworkOption(self, lineedit):
-        try: 
-            # Read the validated value from the network option that was submitted.
-            value = lineedit.text()
+    def openNetworkSettings(self):
+        """Open the modal editor after all persisted network values are loaded."""
+        NetworkSettingsDialog(self).exec_()
 
-            #If value is invalid
-            if not value:
-                raise Exception(f"Value entered is not valid: {value}!")
+    def applyNetworkSettings(self, user_agent, connection_timeout, read_timeout,
+                             live_status_timeout, live_status_retries,
+                             stream_status_enabled):
+        """Apply and persist all advanced network settings in one operation."""
+        self.current_user_agent = user_agent or Threadpools.DEFAULT_USER_AGENT_HEADER
+        Threadpools.CONNECTION_TIMEOUT = connection_timeout
+        Threadpools.READ_TIMEOUT = read_timeout
+        Threadpools.LIVE_STATUS_TIMEOUT = live_status_timeout
+        Threadpools.LIVE_STATUS_RETRIES = live_status_retries
+        self.stream_status_enabled = stream_status_enabled
+        self._applyStreamStatusVisibility()
 
-            # Preserve every existing preference while updating one network option.
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
             config = configparser.ConfigParser()
-            try:
-                config.read(self.user_data_file)
-            except (configparser.Error, UnicodeDecodeError):
-                config = configparser.ConfigParser()
 
-            #If Timeouts section not yet exists create it
-            if "Timeouts" not in config:
-                config["Timeouts"] = {}
+        config['User-Agent'] = {'user-agent': self.current_user_agent}
+        config['Timeouts'] = {
+            'CONNECTION_TIMEOUT': str(connection_timeout),
+            'READ_TIMEOUT': str(read_timeout),
+            'LIVE_STATUS_TIMEOUT': str(live_status_timeout),
+            'LIVE_STATUS_RETRIES': str(live_status_retries)
+        }
+        config['StreamStatus'] = {'enabled': str(stream_status_enabled)}
 
-            #Check which timeout value has been changed
-            match lineedit:
-                case self.set_connection_timeout:
-                    Threadpools.CONNECTION_TIMEOUT = int(value)
-
-                    config['Timeouts']['CONNECTION_TIMEOUT'] = value
-
-                case self.set_read_timeout:
-                    Threadpools.READ_TIMEOUT = int(value)
-
-                    config['Timeouts']['READ_TIMEOUT'] = value
-
-                case self.set_live_status_timeout:
-                    Threadpools.LIVE_STATUS_TIMEOUT = int(value)
-
-                    config['Timeouts']['LIVE_STATUS_TIMEOUT'] = value
-
-                case self.set_live_status_retries:
-                    Threadpools.LIVE_STATUS_RETRIES = int(value)
-
-                    config['Timeouts']['LIVE_STATUS_RETRIES'] = value
-
-            #Write config file
+        try:
             with open(self.user_data_file, 'w') as config_file:
                 config.write(config_file)
-
-            self.animate_progress(0, 100, "Successfully adjusted network setting")
-
-        except Exception as e:
-            self.animate_progress(0, 100, f"Failed setting network option: {e}")
+            self.animate_progress(0, 100, "Network settings saved")
+        except OSError as e:
+            print(f"Could not write user data file: {e}")
+            self.animate_progress(0, 100, f"Failed saving network settings: {e}")
 
     def loadDefaultNetworkOptions(self):
         try:
@@ -1130,45 +1163,29 @@ class IPTVPlayerApp(QMainWindow):
             except (configparser.Error, UnicodeDecodeError):
                 config = configparser.ConfigParser()
 
-            #Set default values
-            tmp_connection_timeout  = str(Threadpools.CONNECTION_TIMEOUT)
-            tmp_read_timeout        = str(Threadpools.READ_TIMEOUT)
-            tmp_live_status_timeout = str(Threadpools.LIVE_STATUS_TIMEOUT)
-            tmp_live_status_retries = str(Threadpools.LIVE_STATUS_RETRIES)
+            # Clamp manually edited values to the same ranges as the dialog. Each
+            # value falls back independently, so one bad entry cannot discard the rest.
+            def read_bounded_integer(option, default, minimum, maximum):
+                try:
+                    value = config.getint("Timeouts", option, fallback=default)
+                except (ValueError, configparser.Error):
+                    value = default
+                return max(minimum, min(value, maximum))
 
-            #Check if defined in config
             if config.has_section("Timeouts"):
-                if config.has_option("Timeouts", "CONNECTION_TIMEOUT"):
-                    #Set connection timeout if defined
-                    Threadpools.CONNECTION_TIMEOUT = int(config['Timeouts']['CONNECTION_TIMEOUT'])
-                    tmp_connection_timeout = config['Timeouts']['CONNECTION_TIMEOUT']
-
-                if config.has_option("Timeouts", "READ_TIMEOUT"):
-                    #Set read timeout if defined
-                    Threadpools.READ_TIMEOUT = int(config['Timeouts']['READ_TIMEOUT'])
-                    tmp_read_timeout = config['Timeouts']['READ_TIMEOUT']
-
-                if config.has_option("Timeouts", "LIVE_STATUS_TIMEOUT"):
-                    #Set live status timeout if defined
-                    Threadpools.LIVE_STATUS_TIMEOUT = int(config['Timeouts']['LIVE_STATUS_TIMEOUT'])
-                    tmp_live_status_timeout = config['Timeouts']['LIVE_STATUS_TIMEOUT']
-
-                if config.has_option("Timeouts", "LIVE_STATUS_RETRIES"):
-                    # Clamp manually edited values to the same range as the GUI.
-                    Threadpools.LIVE_STATUS_RETRIES = max(
-                        0,
-                        min(
-                            int(config['Timeouts']['LIVE_STATUS_RETRIES']),
-                            Threadpools.MAX_LIVE_STATUS_RETRIES
-                        )
-                    )
-                    tmp_live_status_retries = str(Threadpools.LIVE_STATUS_RETRIES)
-                    
-            #Set values in corresponding LineEdit widgets
-            self.set_connection_timeout.setText(tmp_connection_timeout)
-            self.set_read_timeout.setText(tmp_read_timeout)
-            self.set_live_status_timeout.setText(tmp_live_status_timeout)
-            self.set_live_status_retries.setText(tmp_live_status_retries)
+                Threadpools.CONNECTION_TIMEOUT = read_bounded_integer(
+                    "CONNECTION_TIMEOUT", Threadpools.DEFAULT_CONNECTION_TIMEOUT, 1, 999
+                )
+                Threadpools.READ_TIMEOUT = read_bounded_integer(
+                    "READ_TIMEOUT", Threadpools.DEFAULT_READ_TIMEOUT, 1, 999
+                )
+                Threadpools.LIVE_STATUS_TIMEOUT = read_bounded_integer(
+                    "LIVE_STATUS_TIMEOUT", Threadpools.DEFAULT_LIVE_STATUS_TIMEOUT, 1, 999
+                )
+                Threadpools.LIVE_STATUS_RETRIES = read_bounded_integer(
+                    "LIVE_STATUS_RETRIES", Threadpools.DEFAULT_LIVE_STATUS_RETRIES,
+                    0, Threadpools.MAX_LIVE_STATUS_RETRIES
+                )
 
         except Exception as e:
             print(f"Failed loading default timeout values: {e}")
@@ -1449,33 +1466,19 @@ class IPTVPlayerApp(QMainWindow):
         self.theme_select_box.blockSignals(False)
         self._apply_theme(mode)
 
-    def toggleStreamStatus(self, state):
-        checked = bool(state)
-        self.stream_status_enabled = checked
-
+    def _applyStreamStatusVisibility(self):
+        """Keep the indicator visibility consistent with the no-probe preference."""
         # Hiding the widget also releases its reserved space in the title layout.
         # More importantly, startOnlineWorker() uses the same flag to avoid sending
         # any future probe request to the IPTV provider.
         try:
-            self.live_info_box.stream_status.setVisible(checked)
-            if not checked:
+            self.live_info_box.stream_status.setVisible(self.stream_status_enabled)
+            if not self.stream_status_enabled:
                 self.live_info_box.stream_status.setPixmap(
                     QPixmap(self.path_to_unknown_status_icon).scaledToWidth(24)
                 )
         except Exception:
             pass
-
-        config = configparser.ConfigParser()
-        try:
-            config.read(self.user_data_file)
-        except (configparser.Error, UnicodeDecodeError):
-            config = configparser.ConfigParser()
-        config['StreamStatus'] = {'enabled': str(checked)}
-        try:
-            with open(self.user_data_file, 'w') as config_file:
-                config.write(config_file)
-        except OSError as e:
-            print(f"Could not write user data file: {e}")
 
     def loadDefaultStreamStatus(self):
         config = configparser.ConfigParser()
@@ -1489,15 +1492,7 @@ class IPTVPlayerApp(QMainWindow):
         else:
             self.stream_status_enabled = True
 
-        # Block the signal while restoring the checkbox because loading a preference
-        # must not rewrite userdata.ini. Apply the indicator visibility explicitly;
-        # setting an already-unchecked checkbox would otherwise emit no signal.
-        self.stream_status_checkbox.blockSignals(True)
-        self.stream_status_checkbox.setCheckState(
-            Qt.Checked if self.stream_status_enabled else Qt.Unchecked
-        )
-        self.stream_status_checkbox.blockSignals(False)
-        self.live_info_box.stream_status.setVisible(self.stream_status_enabled)
+        self._applyStreamStatusVisibility()
 
     def toggleVODs(self, state):
         checked = bool(state)
