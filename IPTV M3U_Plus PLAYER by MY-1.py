@@ -32,9 +32,9 @@ from PyQt5.QtWidgets import (
 from AccountManager import AccountManager
 from CustomPyQtWidgets import LiveInfoBox, MovieInfoBox, SeriesInfoBox, EmbeddedPlayerWindow
 import Threadpools
-from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher
+from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher, AccountInfoWorker
 
-CURRENT_VERSION = "V2.01.05"
+CURRENT_VERSION = "V2.01.06"
 REMEMBER_CATEGORY_SORTING = "Remember per category"
 
 # CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
@@ -104,6 +104,25 @@ class NetworkSettingsDialog(QDialog):
         general_form.addRow("Connection timeout:", self.connection_timeout_spin)
         general_form.addRow("Read timeout:", self.read_timeout_spin)
 
+        self.account_refresh_checkbox = QCheckBox("Enable automatic Info refresh")
+        self.account_refresh_checkbox.setChecked(parent.account_info_auto_refresh_enabled)
+        self.account_refresh_checkbox.setToolTip(
+            "Refresh account information periodically while the Info tab is visible"
+        )
+        self.account_refresh_spin = self._create_seconds_spinbox(
+            parent.account_info_refresh_interval,
+            "Automatic account information refresh interval while the Info tab is visible"
+        )
+        self.account_refresh_spin.setRange(10, 3600)
+        self.account_refresh_checkbox.toggled.connect(
+            self.account_refresh_spin.setEnabled
+        )
+        self.account_refresh_spin.setEnabled(
+            self.account_refresh_checkbox.isChecked()
+        )
+        general_form.addRow(self.account_refresh_checkbox)
+        general_form.addRow("Info auto-refresh interval:", self.account_refresh_spin)
+
         live_group = QGroupBox("LIVE stream status")
         live_layout = QVBoxLayout(live_group)
         self.live_status_checkbox = QCheckBox("Enable LIVE stream status checks")
@@ -168,6 +187,10 @@ class NetworkSettingsDialog(QDialog):
         self.live_status_checkbox.setChecked(True)
         self.live_timeout_spin.setValue(Threadpools.DEFAULT_LIVE_STATUS_TIMEOUT)
         self.live_retries_spin.setValue(Threadpools.DEFAULT_LIVE_STATUS_RETRIES)
+        self.account_refresh_spin.setValue(
+            Threadpools.DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL
+        )
+        self.account_refresh_checkbox.setChecked(True)
 
     def save_settings(self):
         """Apply the complete dialog state as one coherent configuration update."""
@@ -177,7 +200,9 @@ class NetworkSettingsDialog(QDialog):
             self.read_timeout_spin.value(),
             self.live_timeout_spin.value(),
             self.live_retries_spin.value(),
-            self.live_status_checkbox.isChecked()
+            self.live_status_checkbox.isChecked(),
+            self.account_refresh_spin.value(),
+            self.account_refresh_checkbox.isChecked()
         )
         self.accept()
 
@@ -437,6 +462,19 @@ class IPTVPlayerApp(QMainWindow):
         #can be disabled in the Settings tab if a provider's streams are flaky and
         #the probe is producing false offline reports.
         self.stream_status_enabled = True
+
+        # Account metadata has its own lightweight worker and timer. It must never
+        # trigger a playlist, category, stream, or EPG reload.
+        self.account_info_refresh_interval = (
+            Threadpools.DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL
+        )
+        self.account_info_auto_refresh_enabled = True
+        self.account_info_refresh_in_progress = False
+        self.account_info_worker = None
+        self.account_info_threadpool = QThreadPool()
+        self.account_info_threadpool.setMaxThreadCount(1)
+        self.account_info_timer = QTimer(self)
+        self.account_info_timer.timeout.connect(self.refreshAccountInfo)
 
         self.initIcons()
 
@@ -832,7 +870,7 @@ class IPTVPlayerApp(QMainWindow):
         self.movies_tab   = QWidget()
         self.series_tab   = QWidget()
         favorites_tab     = QWidget()
-        info_tab          = QWidget()
+        self.info_tab     = QWidget()
         settings_tab      = QWidget()
 
         #Create layouts for tabs
@@ -841,7 +879,7 @@ class IPTVPlayerApp(QMainWindow):
         self.movies_tab_layout      = QVBoxLayout(self.movies_tab)
         self.series_tab_layout      = QVBoxLayout(self.series_tab)
         self.favorites_tab_layout   = QGridLayout(favorites_tab)
-        self.info_tab_layout        = QVBoxLayout(info_tab)
+        self.info_tab_layout        = QVBoxLayout(self.info_tab)
         self.settings_layout        = QGridLayout(settings_tab)
 
         #Add created tabs to tab widget with their names
@@ -850,8 +888,9 @@ class IPTVPlayerApp(QMainWindow):
         self.tab_widget.addTab(self.movies_tab, self.movies_icon,       "Movies")
         self.tab_widget.addTab(self.series_tab, self.series_icon,       "Series")
         # self.tab_widget.addTab(favorites_tab,   self.favorites_icon,    "Favorites")
-        self.tab_widget.addTab(info_tab,        self.info_icon,         "Info")
+        self.tab_widget.addTab(self.info_tab,   self.info_icon,         "Info")
         self.tab_widget.addTab(settings_tab,    self.settings_icon,     "Settings")
+        self.tab_widget.currentChanged.connect(self._onCurrentTabChanged)
 
     def initSearchBars(self):
         #Initialize search bars for category lists
@@ -1369,6 +1408,21 @@ class IPTVPlayerApp(QMainWindow):
             list_widget.viewport().update()
 
     def initIPTVinfo(self):
+        info_controls = QHBoxLayout()
+        self.refresh_account_info_button = QPushButton("Refresh")
+        self.refresh_account_info_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
+        )
+        self.refresh_account_info_button.setToolTip(
+            "Refresh account status and active connections only"
+        )
+        self.refresh_account_info_button.clicked.connect(self.refreshAccountInfo)
+        self.account_info_last_refresh_label = QLabel("Not refreshed yet")
+        info_controls.addWidget(self.refresh_account_info_button)
+        info_controls.addWidget(self.account_info_last_refresh_label)
+        info_controls.addStretch()
+        self.info_tab_layout.addLayout(info_controls)
+
         self.iptv_info_text = QTextEdit()
         self.iptv_info_text.setReadOnly(True)
 
@@ -1860,7 +1914,7 @@ class IPTVPlayerApp(QMainWindow):
 
         self.advanced_network_button = QPushButton("Advanced network settings…")
         self.advanced_network_button.setToolTip(
-            "Configure request timeouts, LIVE status checks, retries, and User-Agent"
+            "Configure request timeouts, Info refresh, LIVE status checks, retries, and User-Agent"
         )
         self.advanced_network_button.clicked.connect(self.openNetworkSettings)
 
@@ -1955,7 +2009,8 @@ class IPTVPlayerApp(QMainWindow):
 
     def applyNetworkSettings(self, user_agent, connection_timeout, read_timeout,
                              live_status_timeout, live_status_retries,
-                             stream_status_enabled):
+                             stream_status_enabled, account_refresh_interval,
+                             account_auto_refresh_enabled):
         """Apply and persist all advanced network settings in one operation."""
         self.current_user_agent = user_agent or Threadpools.DEFAULT_USER_AGENT_HEADER
         Threadpools.CONNECTION_TIMEOUT = connection_timeout
@@ -1963,7 +2018,10 @@ class IPTVPlayerApp(QMainWindow):
         Threadpools.LIVE_STATUS_TIMEOUT = live_status_timeout
         Threadpools.LIVE_STATUS_RETRIES = live_status_retries
         self.stream_status_enabled = stream_status_enabled
+        self.account_info_refresh_interval = account_refresh_interval
+        self.account_info_auto_refresh_enabled = account_auto_refresh_enabled
         self._applyStreamStatusVisibility()
+        self._updateAccountInfoTimer()
 
         config = configparser.ConfigParser()
         try:
@@ -1979,6 +2037,10 @@ class IPTVPlayerApp(QMainWindow):
             'LIVE_STATUS_RETRIES': str(live_status_retries)
         }
         config['StreamStatus'] = {'enabled': str(stream_status_enabled)}
+        config['AccountInfo'] = {
+            'refresh_interval': str(account_refresh_interval),
+            'auto_refresh_enabled': str(account_auto_refresh_enabled)
+        }
 
         try:
             with open(self.user_data_file, 'w') as config_file:
@@ -2021,6 +2083,26 @@ class IPTVPlayerApp(QMainWindow):
                     "LIVE_STATUS_RETRIES", Threadpools.DEFAULT_LIVE_STATUS_RETRIES,
                     0, Threadpools.MAX_LIVE_STATUS_RETRIES
                 )
+
+            try:
+                self.account_info_refresh_interval = config.getint(
+                    'AccountInfo', 'refresh_interval',
+                    fallback=Threadpools.DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL
+                )
+            except (ValueError, configparser.Error):
+                self.account_info_refresh_interval = (
+                    Threadpools.DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL
+                )
+            self.account_info_refresh_interval = max(
+                10, min(self.account_info_refresh_interval, 3600)
+            )
+            try:
+                self.account_info_auto_refresh_enabled = config.getboolean(
+                    'AccountInfo', 'auto_refresh_enabled', fallback=True
+                )
+            except (ValueError, configparser.Error):
+                self.account_info_auto_refresh_enabled = True
+            self._updateAccountInfoTimer()
 
         except Exception as e:
             print(f"Failed loading default timeout values: {e}")
@@ -2556,6 +2638,113 @@ class IPTVPlayerApp(QMainWindow):
         dataWorker.signals.show_info_msg.connect(self.show_info_msg)
         self.threadpool.start(dataWorker)
 
+    def _isInfoTabVisible(self):
+        """Return whether Info is the currently selected visible tab."""
+        return self.tab_widget.currentWidget() is self.info_tab
+
+    def _updateAccountInfoTimer(self):
+        """Run automatic refreshes only while Info is selected and enabled."""
+        should_run = (
+            self.account_info_auto_refresh_enabled
+            and self._isInfoTabVisible()
+            and bool(self.server and self.username and self.password)
+        )
+        if should_run:
+            self.account_info_timer.start(
+                self.account_info_refresh_interval * 1000
+            )
+        else:
+            self.account_info_timer.stop()
+
+    def _onCurrentTabChanged(self, _index):
+        """Refresh immediately on Info, then start or stop its periodic timer."""
+        self._updateAccountInfoTimer()
+        if self._isInfoTabVisible():
+            # Entering Info should show the current connection count immediately;
+            # disabling auto-refresh affects only subsequent periodic requests.
+            self.refreshAccountInfo()
+
+    def refreshAccountInfo(self):
+        """Refresh account metadata without downloading provider content."""
+        if self.account_info_refresh_in_progress:
+            return
+        if not self.server or not self.username or not self.password:
+            self.account_info_last_refresh_label.setText("No account selected")
+            return
+
+        self.account_info_refresh_in_progress = True
+        self.refresh_account_info_button.setEnabled(False)
+        self.account_info_last_refresh_label.setText("Refreshing…")
+        worker = AccountInfoWorker(
+            self.server,
+            self.username,
+            self.password,
+            self.current_user_agent
+        )
+        worker.signals.finished.connect(self._accountInfoRefreshFinished)
+        worker.signals.error.connect(self._accountInfoRefreshFailed)
+        # Keep the Python wrapper alive until the QRunnable has emitted its result.
+        self.account_info_worker = worker
+        self.account_info_threadpool.start(worker)
+
+    def _accountInfoRefreshFinished(self, iptv_info):
+        """Display the refreshed metadata and release the request guard."""
+        self.account_info_refresh_in_progress = False
+        self.account_info_worker = None
+        self.refresh_account_info_button.setEnabled(True)
+        self.updateAccountInfo(iptv_info)
+
+    def _accountInfoRefreshFailed(self, error):
+        """Keep existing information visible when a lightweight refresh fails."""
+        self.account_info_refresh_in_progress = False
+        self.account_info_worker = None
+        self.refresh_account_info_button.setEnabled(True)
+        self.account_info_last_refresh_label.setText(
+            f"Refresh failed at {datetime.now().strftime('%H:%M:%S')}"
+        )
+        print(f"Failed refreshing account information: {error}")
+
+    def updateAccountInfo(self, iptv_info):
+        """Render account and server metadata returned by player_api.php."""
+        user_info = iptv_info.get("user_info", {})
+        server_info = iptv_info.get("server_info", {})
+
+        hostname = server_info.get("url", "Unknown")
+        port = server_info.get("port", "Unknown")
+        host = (
+            "Unknown"
+            if hostname == "Unknown" or port == "Unknown"
+            else f"http://{hostname}:{port}"
+        )
+
+        def format_timestamp(value):
+            """Format optional provider timestamps without breaking the Info tab."""
+            try:
+                return datetime.fromtimestamp(int(value)).strftime("%B %d, %Y")
+            except (TypeError, ValueError, OSError, OverflowError):
+                return "Unknown"
+
+        expiry = format_timestamp(user_info.get("exp_date"))
+        created_at = format_timestamp(user_info.get("created_at"))
+        trial = "Yes" if user_info.get("is_trial") == "1" else "No"
+
+        self.iptv_info_text.setText(
+            f"Host: {host}\n"
+            f"Username: {user_info.get('username', 'Unknown')}\n"
+            f"Password: {user_info.get('password', 'Unknown')}\n"
+            f"Max Connections: {user_info.get('max_connections', 'Unknown')}\n"
+            f"Active Connections: {user_info.get('active_cons', 'Unknown')}\n"
+            f"Timezone: {server_info.get('timezone', 'Unknown')}\n"
+            f"Trial: {trial}\n"
+            f"Status: {user_info.get('status', 'Unknown')}\n"
+            f"Created At: {created_at}\n"
+            f"Expiry: {expiry}\n"
+        )
+        self.account_info_last_refresh_label.setText(
+            f"Last refreshed: {datetime.now().strftime('%H:%M:%S')}"
+        )
+        self._updateAccountInfoTimer()
+
     def process_data(self, iptv_info, categories_per_stream_type, entries_per_stream_type):
         print("Going to process IPTV data now")
 
@@ -2573,61 +2762,7 @@ class IPTVPlayerApp(QMainWindow):
         self.set_progress_bar(0, "Processing received data...")
 
         #Process IPTV info
-        user_info   = iptv_info.get("user_info", {})
-        server_info = iptv_info.get("server_info", {})
-
-        hostname    = server_info.get("url", "Unknown")
-        port        = server_info.get("port", "Unknown")
-        if hostname == "Unknown" or port == "Unknown":
-            host = "Unknown"
-        else:
-            host = f"http://{hostname}:{port}"
-
-        username                = user_info.get("username", "Unknown")
-        password                = user_info.get("password", "Unknown")
-        max_connections         = user_info.get("max_connections", "Unknown")
-        active_connections      = user_info.get("active_cons", "Unknown")
-        status                  = user_info.get("status", "Unknown")
-        expire_timestamp        = user_info.get("exp_date", 0)
-        created_at_timestamp    = user_info.get("created_at", 0)
-
-        #If a value is given
-        if expire_timestamp:
-            #Convert date time variable to string
-            expiry = datetime.fromtimestamp(int(expire_timestamp)).strftime("%B %d, %Y")
-        else:
-            expiry = "Unknown"
-
-        #If a value is given
-        if created_at_timestamp:
-            #Convert date time variable to string
-            created_at = datetime.fromtimestamp(int(created_at_timestamp)).strftime("%B %d, %Y")
-        else:
-            created_at = "Unknown"
-
-        if user_info.get("is_trial") == "1":
-            trial = "Yes"
-        else:
-            trial = "No"
-
-        timezone = server_info.get("timezone", "Unknown")
-
-        formatted_data = (
-            f"Host: {host}\n"
-            f"Username: {username}\n"
-            f"Password: {password}\n"
-            f"Max Connections: {max_connections}\n"
-            f"Active Connections: {active_connections}\n"
-            f"Timezone: {timezone}\n"
-            f"Trial: {trial}\n"
-            f"Status: {status}\n"
-            f"Created At: {created_at}\n"
-            f"Expiry: {expiry}\n"
-        )
-
-        #Set formatted data to iptv info tab
-        self.iptv_info_text.setText(formatted_data)
-        QtWidgets.qApp.processEvents()
+        self.updateAccountInfo(iptv_info)
 
         #Process categories and entries
         hidden_categories_changed = False

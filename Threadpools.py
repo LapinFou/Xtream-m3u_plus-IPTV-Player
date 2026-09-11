@@ -38,6 +38,7 @@ DEFAULT_CONNECTION_TIMEOUT  = 3
 DEFAULT_READ_TIMEOUT         = 30
 DEFAULT_LIVE_STATUS_TIMEOUT  = 7
 DEFAULT_LIVE_STATUS_RETRIES  = 2
+DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL = 60
 
 # LIVE status retries are additional attempts, so the default value of 2 allows
 # up to 3 probes including the initial request.
@@ -48,6 +49,49 @@ LIVE_STATUS_RETRIES      = DEFAULT_LIVE_STATUS_RETRIES
 LIVE_STATUS_RETRY_DELAY  = 0.5
 LIVE_STATUS_CHUNK_SIZE   = 4096
 MAX_LIVE_STATUS_RETRIES  = 10
+
+
+class AccountInfoWorkerSignals(QObject):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+
+class AccountInfoWorker(QRunnable):
+    """Fetch only account/server metadata from the Xtream player API."""
+
+    def __init__(self, server, username, password, user_agent):
+        super().__init__()
+        self.server = server
+        self.username = username
+        self.password = password
+        self.user_agent = user_agent
+        self.signals = AccountInfoWorkerSignals()
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            headers = {
+                "Connection": CONNECTION_HEADER,
+                "Accept-Encoding": CONTENT_HEADER,
+                "User-Agent": self.user_agent or DEFAULT_USER_AGENT_HEADER
+            }
+            response = requests.get(
+                f"{self.server}/player_api.php",
+                params={
+                    'username': self.username,
+                    'password': self.password,
+                    'action': ''
+                },
+                headers=headers,
+                timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT)
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError("The provider returned invalid account information")
+            self.signals.finished.emit(data)
+        except Exception as error:
+            self.signals.error.emit(str(error))
 
 class FetchDataWorkerSignals(QObject):
     finished        = pyqtSignal(dict, dict, dict)
