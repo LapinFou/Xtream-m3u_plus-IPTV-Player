@@ -32,7 +32,7 @@ from CustomPyQtWidgets import LiveInfoBox, MovieInfoBox, SeriesInfoBox, Embedded
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher
 
-CURRENT_VERSION = "V2.01.00"
+CURRENT_VERSION = "V2.01.01"
 
 # CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
 # Increment the schema only when a release changes persisted data and add a matching,
@@ -272,6 +272,28 @@ class IPTVPlayerApp(QMainWindow):
             'Series': [],
             'Seasons': [],
             'Episodes': []
+        }
+
+        # Cache the filtered and ordered entry lists used by category views. The
+        # provider data is already cached, but preparing "All" again can still scan
+        # and sort tens of thousands of Movies every time the user returns to it.
+        self.category_view_cache = {
+            'LIVE': {},
+            'Movies': {},
+            'Series': {}
+        }
+        # QListWidgetItem creation dominates category switching for very large
+        # catalogs. Detached items can safely be kept and reattached when the same
+        # view is opened again, making repeated switches effectively immediate.
+        self.category_item_cache = {
+            'LIVE': {},
+            'Movies': {},
+            'Series': {}
+        }
+        self.active_category_view_key = {
+            'LIVE': None,
+            'Movies': None,
+            'Series': None
         }
 
         # Each content type can be hidden and omitted from provider requests.
@@ -731,6 +753,29 @@ class IPTVPlayerApp(QMainWindow):
         #Get list
         list_widget = list_widgets[stream_type]
 
+        # Top-level stream catalogs can contain tens of thousands of rows. Qt's
+        # native QListWidget sort runs entirely in the GUI thread and can freeze the
+        # whole application for several seconds. Sort the lightweight dictionaries
+        # first, then rebuild the widget in cooperative chunks.
+        is_top_level_stream_view = (
+            list_content_type == 'streaming'
+            and (stream_type != 'Series' or self.series_navigation_level == 0)
+        )
+        if is_top_level_stream_view:
+            ordered_entries = list(self.currently_loaded_streams[stream_type])
+            if sorting_enabled:
+                ordered_entries.sort(
+                    key=lambda entry: entry.get('name', '').casefold(),
+                    reverse=(sort_order == 1)
+                )
+
+            self.currently_loaded_streams[stream_type] = ordered_entries
+            self._replace_streaming_list_items(stream_type, ordered_entries)
+            self.set_progress_bar(
+                100, f"Finished sorting {stream_type} {list_content_type}"
+            )
+            return
+
         # The Seasons view (Series tab, navigation level 1) needs numeric ordering, not Qt's
         # default text sort — otherwise "Season 10" comes before "Season 2". Issue #18.
         is_seasons_view = (
@@ -818,6 +863,42 @@ class IPTVPlayerApp(QMainWindow):
             list_widget.viewport().update()
 
         self.animate_progress(0, 100, f"Finished sorting {stream_type} {list_content_type}")
+
+    def _replace_streaming_list_items(self, stream_type, entries):
+        """Replace a large stream list while periodically yielding to Qt."""
+        list_widget = self.streaming_list_widgets[stream_type]
+        category_widget = self.category_list_widgets[stream_type]
+        chunk_size = 1000
+
+        list_widget.setSortingEnabled(False)
+        list_widget.setUpdatesEnabled(False)
+        category_widget.setEnabled(False)
+        try:
+            list_widget.clear()
+            total_entries = len(entries)
+            for start in range(0, total_entries, chunk_size):
+                chunk = entries[start:start + chunk_size]
+                first_row = list_widget.count()
+                list_widget.addItems([
+                    entry.get('name', '') for entry in chunk
+                ])
+                for offset, entry in enumerate(chunk):
+                    list_widget.item(first_row + offset).setData(Qt.UserRole, entry)
+
+                # Process pending paint and input events between chunks so switching
+                # tabs and using the rest of the application remains responsive.
+                self.set_progress_bar(
+                    int(min(99, ((start + len(chunk)) * 100) / total_entries)),
+                    f"Loading {stream_type} streams: "
+                    f"{start + len(chunk)} of {total_entries}"
+                )
+
+            if not entries:
+                list_widget.addItem("No items in list...")
+        finally:
+            category_widget.setEnabled(True)
+            list_widget.setUpdatesEnabled(True)
+            list_widget.viewport().update()
 
     def initIPTVinfo(self):
         self.iptv_info_text = QTextEdit()
@@ -1029,6 +1110,15 @@ class IPTVPlayerApp(QMainWindow):
             case _:
                 self.sorting_enabled    = False
                 self.sorting_order      = 0
+
+        # Cached category views include the selected ordering, so discard them when
+        # the global sorting preference changes.
+        for stream_cache in self.category_view_cache.values():
+            stream_cache.clear()
+        for item_cache in self.category_item_cache.values():
+            item_cache.clear()
+        for stream_type in self.active_category_view_key:
+            self.active_category_view_key[stream_type] = None
 
         self.setAllSortingOrder(sorting_order)
 
@@ -1760,10 +1850,11 @@ class IPTVPlayerApp(QMainWindow):
         self.set_progress_state(progress_state)
         self.progress_bar.setFormat(text)
         if progress_state == "busy" and val <= 0:
-            # An unknown-duration operation has no meaningful percentage yet. Qt's
-            # 0..0 range displays an animated blue busy bar instead of an empty white
-            # bar that can make the application appear idle or frozen.
-            self.progress_bar.setRange(0, 0)
+            # Qt hides the format text while a QProgressBar uses its indeterminate
+            # 0..0 range. A full blue bar communicates the unknown-duration busy
+            # state while keeping the operation message visible in the center.
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
         else:
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(val)
@@ -1836,6 +1927,14 @@ class IPTVPlayerApp(QMainWindow):
 
         self.categories_per_stream_type = categories_per_stream_type
         self.entries_per_stream_type    = entries_per_stream_type
+
+        # A refreshed provider snapshot invalidates every prepared category view.
+        for stream_cache in self.category_view_cache.values():
+            stream_cache.clear()
+        for item_cache in self.category_item_cache.values():
+            item_cache.clear()
+        for stream_type in self.active_category_view_key:
+            self.active_category_view_key[stream_type] = None
 
         self.set_progress_bar(0, "Processing received data...")
 
@@ -1939,24 +2038,13 @@ class IPTVPlayerApp(QMainWindow):
             #Sort category list
             self.sortList(self.category_search_bars[stream_type], 'category', stream_type, self.category_list_widgets, self.sorting_enabled, self.sorting_order)
 
-            #Add streams in streaming list
-            num_of_entries = len(self.entries_per_stream_type[stream_type])
-            prev_perc = 0
-            for idx, entry in enumerate(self.entries_per_stream_type[stream_type]):
-                item = QListWidgetItem(entry['name'])
-                item.setData(Qt.UserRole, entry)
-                # item.setIcon(channel_icon)
-
-                self.streaming_list_widgets[stream_type].addItem(item)
-
-                perc = (idx * 100) / num_of_entries
-                if (perc - prev_perc) > 10:
-                    prev_perc = perc
-                    self.set_progress_bar(int(perc), f"Loading {stream_type} streams: {idx} of {num_of_entries}")
-                    QtWidgets.qApp.processEvents()
-
-            #Sort streaming list
+            # Build the stream list once in its final order. sortList() uses chunked
+            # insertion for top-level catalogs so large Movie libraries do not block
+            # the main window while Qt creates their rows.
             self.sortList(self.streaming_search_bars[stream_type], 'streaming', stream_type, self.streaming_list_widgets, self.sorting_enabled, self.sorting_order)
+            self.active_category_view_key[stream_type] = self._category_view_key(
+                self.all_categories_text
+            )
 
         self.set_progress_bar(100, f"Finished loading")
         QtWidgets.qApp.processEvents()
@@ -2271,6 +2359,24 @@ class IPTVPlayerApp(QMainWindow):
             with open(self.favorites_file, 'w') as fav_file:
                 json.dump(fav_data, fav_file, indent=4)
 
+            # Only the Favorites view changes here. Other cached category lists keep
+            # references to the same entry dictionaries and remain valid.
+            stream_cache = self.category_view_cache.get(stream_type, {})
+            favorite_keys = [key for key in stream_cache if key[0] == 'favorites']
+            for key in favorite_keys:
+                stream_cache.pop(key, None)
+
+            item_cache = self.category_item_cache.get(stream_type, {})
+            favorite_item_keys = [key for key in item_cache if key[0] == 'favorites']
+            for key in favorite_item_keys:
+                item_cache.pop(key, None)
+
+            # A Favorites view currently attached to the widget is also stale. Mark
+            # it as non-cacheable so switching away does not preserve the old rows.
+            active_key = self.active_category_view_key.get(stream_type)
+            if active_key and active_key[0] == 'favorites':
+                self.active_category_view_key[stream_type] = None
+
         except Exception as e:
             self.animate_progress(0, 100, "Failed adding to favorites", "error")
 
@@ -2302,6 +2408,45 @@ class IPTVPlayerApp(QMainWindow):
         # any ids that no longer exist in the catalog (e.g. removed by the provider).
         by_id = {e.get(id_field): e for e in entries}
         return [by_id[i] for i in ordered_ids if i in by_id]
+
+    def _category_view_key(self, category_name, category_id=None):
+        """Build the cache key shared by prepared entries and Qt list items."""
+        is_favorites = category_name == self.fav_categories_text
+        if is_favorites:
+            # Favorites deliberately preserve the order stored in favorites.json.
+            return ('favorites',)
+
+        selected_category = None if category_name == self.all_categories_text else category_id
+        return ('category', selected_category, self.sorting_enabled, self.sorting_order)
+
+    def _entries_for_category_view(self, stream_type, category_name, category_id=None):
+        """Return a cached entry order for one top-level category selection."""
+        is_favorites = category_name == self.fav_categories_text
+        cache_key = self._category_view_key(category_name, category_id)
+
+        stream_cache = self.category_view_cache[stream_type]
+        cached_entries = stream_cache.get(cache_key)
+        if cached_entries is not None:
+            return cached_entries
+
+        if is_favorites:
+            prepared_entries = self._favorites_in_user_order(stream_type)
+        elif category_name == self.all_categories_text:
+            prepared_entries = list(self.entries_per_stream_type[stream_type])
+        else:
+            prepared_entries = [
+                entry for entry in self.entries_per_stream_type[stream_type]
+                if entry.get('category_id') == category_id
+            ]
+
+        if self.sorting_enabled and not is_favorites:
+            prepared_entries.sort(
+                key=lambda entry: entry.get('name', '').casefold(),
+                reverse=(self.sorting_order == 1)
+            )
+
+        stream_cache[cache_key] = prepared_entries
+        return prepared_entries
 
     def category_item_clicked(self, clicked_item):
         try:
@@ -2339,53 +2484,67 @@ class IPTVPlayerApp(QMainWindow):
                 #Reset navigation level
                 self.series_navigation_level = 0
 
-            #Clear items in list
-            self.streaming_list_widgets[stream_type].clear()
-            self.currently_loaded_streams[stream_type].clear()
-
-            #Reset scrollbar position to top
-            self.streaming_list_widgets[stream_type].scrollToTop()
-
             is_favorites_view = (selected_item_text == self.fav_categories_text)
 
-            # For the Favorites view, walk the favorites.json id list so items
-            # appear in the order the user marked them — not alphabetically and not
-            # in the order the provider returned the catalog (issue #17).
-            if is_favorites_view:
-                ordered_entries = self._favorites_in_user_order(stream_type)
-                for entry in ordered_entries:
-                    item = QListWidgetItem(entry['name'])
-                    item.setData(Qt.UserRole, entry)
-                    self.currently_loaded_streams[stream_type].append(entry)
-                    self.streaming_list_widgets[stream_type].addItem(item)
-            else:
-                for entry in self.entries_per_stream_type[stream_type]:
-                    if selected_item_text == self.all_categories_text:
-                        item = QListWidgetItem(entry['name'])
-                        item.setData(Qt.UserRole, entry)
+            prepared_entries = self._entries_for_category_view(
+                stream_type,
+                selected_item_text,
+                None if is_favorites_view or selected_item_text == self.all_categories_text else category_id
+            )
+            self.currently_loaded_streams[stream_type] = list(prepared_entries)
 
-                        self.currently_loaded_streams[stream_type].append(entry)
-                        self.streaming_list_widgets[stream_type].addItem(item)
+            list_widget = self.streaming_list_widgets[stream_type]
+            target_view_key = self._category_view_key(
+                selected_item_text,
+                None if is_favorites_view or selected_item_text == self.all_categories_text else category_id
+            )
+            list_widget.setSortingEnabled(False)
+            list_widget.setUpdatesEnabled(False)
+            try:
+                active_view_key = self.active_category_view_key.get(stream_type)
+                search_is_empty = not self.streaming_search_bars[stream_type].text()
+                if active_view_key is not None and search_is_empty:
+                    # Detach from the end so row removal stays O(n), then restore the
+                    # original order before storing the reusable item objects.
+                    detached_items = [
+                        list_widget.takeItem(row)
+                        for row in range(list_widget.count() - 1, -1, -1)
+                    ]
+                    detached_items.reverse()
+                    self.category_item_cache[stream_type][active_view_key] = detached_items
+                else:
+                    # Search results and stale Favorites views must never replace a
+                    # complete cached category view.
+                    list_widget.clear()
 
-                    elif entry.get('category_id') == category_id:
-                        item = QListWidgetItem(entry['name'])
-                        item.setData(Qt.UserRole, entry)
+                cached_items = self.category_item_cache[stream_type].pop(
+                    target_view_key, None
+                )
+                if cached_items is not None:
+                    for item in cached_items:
+                        list_widget.addItem(item)
+                else:
+                    # Let Qt create all text rows in one native batch. Assigning the
+                    # dictionaries afterwards retains the existing click handlers.
+                    list_widget.addItems([
+                        entry.get('name', '') for entry in prepared_entries
+                    ])
+                    for row, entry in enumerate(prepared_entries):
+                        list_widget.item(row).setData(Qt.UserRole, entry)
 
-                        self.currently_loaded_streams[stream_type].append(entry)
-                        self.streaming_list_widgets[stream_type].addItem(item)
+                    if not prepared_entries:
+                        list_widget.addItem("No items in list...")
+
+                self.active_category_view_key[stream_type] = target_view_key
+            finally:
+                list_widget.setUpdatesEnabled(True)
+                list_widget.viewport().update()
+
+            # Reset the viewport only after the batch has been installed.
+            list_widget.scrollToTop()
 
             #Check if list is empty after process
-            if self.streaming_list_widgets[stream_type].count() == 0:
-                #Add list is empty text
-                item = QListWidgetItem("No items in list...")
-
-                self.streaming_list_widgets[stream_type].addItem(item)
-            elif not is_favorites_view:
-                #Sort list — but never re-sort the Favorites list, since that would
-                #destroy the user's add-order (issue #17).
-                self.sortList(self.streaming_search_bars[stream_type], 'streaming', stream_type, self.streaming_list_widgets, self.sorting_enabled, self.sorting_order)
-
-            self.animate_progress(0, 100, "Loading finished")
+            self.set_progress_bar(100, "Loading finished")
 
         except Exception as e:
             print(f"Failed: {e}")
