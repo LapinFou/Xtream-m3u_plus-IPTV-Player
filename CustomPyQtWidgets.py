@@ -969,6 +969,8 @@ class EmbeddedPlayerWindow(QMainWindow):
             self._reposition_overlays()
         else:
             self.sidebar.hide()
+            # Closing the sidebar returns to normal overlay auto-hide behaviour.
+            self._wake_controls()
 
     def _refresh_sidebar(self):
         # Use the same search rules as the main lists: ignore case, accents,
@@ -1056,6 +1058,18 @@ class EmbeddedPlayerWindow(QMainWindow):
     # ---------- VLC poll ----------
     def _poll_state(self):
         try:
+            # player.play() returns before libVLC reaches Playing. The initial
+            # _wake_controls() call can therefore see is_playing() == False and
+            # leave the controls visible forever. Start the timer once playback
+            # is actually active, without restarting it on every polling cycle.
+            if (
+                self.player.is_playing()
+                and self.overlay.isVisible()
+                and not self._sidebar_visible
+                and not self._hide_timer.isActive()
+            ):
+                self._hide_timer.start(3000)
+
             length = self.player.get_length()
             cur    = self.player.get_time()
             if length > 0 and not self._seeking:
