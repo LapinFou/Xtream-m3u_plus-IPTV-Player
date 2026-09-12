@@ -75,6 +75,21 @@ def writable_data_directory():
     return path.abspath(".")
 
 
+def macos_bundle_executable(bundle_path):
+    """Resolve the executable declared by a macOS .app bundle."""
+    import plistlib
+
+    info_path = path.join(bundle_path, "Contents", "Info.plist")
+    with open(info_path, "rb") as info_file:
+        executable_name = plistlib.load(info_file).get("CFBundleExecutable", "")
+    if not executable_name:
+        raise OSError(f"The application bundle has no CFBundleExecutable: {bundle_path}")
+    executable_path = path.join(bundle_path, "Contents", "MacOS", executable_name)
+    if not path.isfile(executable_path) or not os.access(executable_path, os.X_OK):
+        raise OSError(f"The application bundle executable is unavailable: {executable_path}")
+    return executable_path
+
+
 def private_url_log_reference(url):
     """Identify a stream in logs without exposing its host or credentials."""
     try:
@@ -4379,6 +4394,18 @@ class IPTVPlayerApp(QMainWindow):
 
                     subprocess.Popen(player_cmd)
 
+                elif is_mac:
+                    # Finder exposes applications as .app bundles, but subprocess
+                    # must launch the executable declared inside the bundle.
+                    player_executable = self.external_player_command
+                    if player_executable.lower().endswith(".app") and path.isdir(player_executable):
+                        player_executable = macos_bundle_executable(player_executable)
+                    player_cmd = [player_executable]
+                    if path.basename(player_executable).lower() == "vlc" and ua:
+                        player_cmd.append(f"--http-user-agent={ua}")
+                    player_cmd.append(url)
+                    subprocess.Popen(player_cmd)
+
                 else:
                     subprocess.Popen([self.external_player_command, url])
 
@@ -4398,7 +4425,8 @@ class IPTVPlayerApp(QMainWindow):
                         f"Could not launch the external player.\n\n"
                         f"Player: {self.external_player_command}\n"
                         f"Error: {e}\n\n"
-                        f"See log.txt for the full traceback."
+                        f"See {path.join(writable_data_directory(), 'log.txt')} "
+                        f"for the full traceback."
                     )
                     error_dialog.setStandardButtons(QMessageBox.Ok)
                     error_dialog.exec_()
@@ -4980,19 +5008,20 @@ class IPTVPlayerApp(QMainWindow):
         dialog.exec_()
 
 def _install_logging():
-    # Write every print() / unhandled exception to log.txt next to the script.
+    # Write every print() and unhandled exception to a persistent log file.
     # The app used to silently die when an external player launch failed; now the
     # traceback ends up on disk where the user can paste it into a bug report.
     import logging, atexit, traceback as _tb
 
-    # In a PyInstaller one-file build, __file__ points into a temporary extraction
-    # directory that is removed on exit. Use the executable directory so diagnostics
-    # remain available beside the EXE after the player closes.
-    application_dir = (
+    # Frozen Windows and Linux builds keep diagnostics beside the executable.
+    # macOS application bundles are read-only in normal use, so their log shares
+    # the writable Application Support directory with the configuration files.
+    application_dir = writable_data_directory() if is_mac else (
         path.dirname(path.abspath(sys.executable))
         if getattr(sys, 'frozen', False)
         else path.dirname(path.abspath(__file__))
     )
+    os.makedirs(application_dir, exist_ok=True)
     log_path = path.join(application_dir, "log.txt")
 
     class _StreamToLogger:
