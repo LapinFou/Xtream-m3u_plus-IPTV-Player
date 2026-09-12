@@ -50,10 +50,25 @@ if [ -d "$DIST_PATH" ]; then
   rm -rf "$DIST_PATH"
 fi
 
-# Use the native macOS icon stored with the other application artwork.
+# Generate all standard and Retina representations through Apple's native tool.
+# Small Finder icons then use their own bitmap instead of shrinking one large icon.
 ICON_ARGS=()
-if [ -f "Images/TV_icon.icns" ]; then
-  ICON_ARGS=(--icon "Images/TV_icon.icns")
+if [ -f "Images/TV_icon.png" ]; then
+  ICONSET_PATH="$BUILD_PATH/TV_icon.iconset"
+  ICNS_PATH="$BUILD_PATH/TV_icon.icns"
+  mkdir -p "$ICONSET_PATH"
+  sips -z 16 16 "Images/TV_icon.png" --out "$ICONSET_PATH/icon_16x16.png" >/dev/null
+  sips -z 32 32 "Images/TV_icon.png" --out "$ICONSET_PATH/icon_16x16@2x.png" >/dev/null
+  sips -z 32 32 "Images/TV_icon.png" --out "$ICONSET_PATH/icon_32x32.png" >/dev/null
+  sips -z 64 64 "Images/TV_icon.png" --out "$ICONSET_PATH/icon_32x32@2x.png" >/dev/null
+  sips -z 128 128 "Images/TV_icon.png" --out "$ICONSET_PATH/icon_128x128.png" >/dev/null
+  sips -z 256 256 "Images/TV_icon.png" --out "$ICONSET_PATH/icon_128x128@2x.png" >/dev/null
+  sips -z 256 256 "Images/TV_icon.png" --out "$ICONSET_PATH/icon_256x256.png" >/dev/null
+  sips -z 512 512 "Images/TV_icon.png" --out "$ICONSET_PATH/icon_256x256@2x.png" >/dev/null
+  sips -z 512 512 "Images/TV_icon.png" --out "$ICONSET_PATH/icon_512x512.png" >/dev/null
+  sips -z 1024 1024 "Images/TV_icon.png" --out "$ICONSET_PATH/icon_512x512@2x.png" >/dev/null
+  iconutil -c icns "$ICONSET_PATH" -o "$ICNS_PATH"
+  ICON_ARGS=(--icon "$ICNS_PATH")
 fi
 
 # Keep the packaged files visible inside the macOS application bundle. This
@@ -96,6 +111,12 @@ fi
   --add-data "CustomPyQtWidgets.py:." \
   --add-data "AccountManager.py:." \
   "$MAIN_SCRIPT"
+
+# The .app bundle contains its own complete copy. Keep only the artifact users
+# install, after confirming that PyInstaller created it successfully.
+if [ -d "$DIST_PATH/IPTV_Player.app" ] && [ -d "$DIST_PATH/IPTV_Player" ]; then
+  rm -rf "$DIST_PATH/IPTV_Player"
+fi
 
 echo
 echo "Build completed: $DIST_PATH/IPTV_Player.app"

@@ -230,8 +230,8 @@ python3 -m pip install --upgrade requests lxml python-dateutil PyQt5
 ### 4. Install the application
 - Open the `dist` folder in Finder.
 - Drag `IPTV_Player.app` into the macOS `Applications` folder.
-- Only the `.app` bundle is required. The neighboring `IPTV_Player` folder is a
-  PyInstaller build output and does not need to be copied.
+- The build script removes PyInstaller's duplicate executable folder after the
+  `.app` bundle has been created, so `dist` contains only the application to install.
 - On first launch, macOS may require Control-clicking the application and choosing
   **Open** because the application is not code-signed.
 
