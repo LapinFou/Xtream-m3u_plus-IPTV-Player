@@ -1,4 +1,7 @@
-from PyQt5.QtGui import QIcon, QFont, QImage, QPixmap, QColor, QDesktopServices, QPalette, QPainter
+from PyQt5.QtGui import (
+    QIcon, QFont, QImage, QPixmap, QColor, QDesktopServices, QPalette,
+    QPainter, QPen, QPolygon
+)
 from PyQt5.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QPoint, QObject, pyqtSignal,
     QRunnable, pyqtSlot, QThreadPool, QModelIndex, QAbstractItemModel, QVariant, QUrl
@@ -370,12 +373,10 @@ QPushButton:disabled { color: #888; background: rgba(45,45,48,80); }
 
 _DARK_OVERLAY_STYLE = """
 QWidget#playerOverlay {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                stop:0 rgba(0,0,0,60), stop:1 rgba(0,0,0,200));
+    background: rgb(20, 20, 22);
 }
 QWidget#playerTopBar {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                stop:0 rgba(0,0,0,200), stop:1 rgba(0,0,0,40));
+    background: rgb(20, 20, 22);
 }
 QLabel#titleLabel { color: white; font-size: 14px; font-weight: bold; }
 QLabel#timeLabel  { color: #eee; font-size: 11px; }
@@ -429,12 +430,10 @@ QPushButton:disabled { color: #999; background: rgba(225,225,225,180); }
 
 _LIGHT_OVERLAY_STYLE = """
 QWidget#playerOverlay {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                stop:0 rgba(245,245,245,170), stop:1 rgba(245,245,245,240));
+    background: rgb(245, 245, 245);
 }
 QWidget#playerTopBar {
-    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                                stop:0 rgba(245,245,245,240), stop:1 rgba(245,245,245,150));
+    background: rgb(245, 245, 245);
 }
 QLabel#titleLabel { color: #202020; font-size: 14px; font-weight: bold; }
 QLabel#timeLabel  { color: #303030; font-size: 11px; }
@@ -519,7 +518,7 @@ class EmbeddedPlayerWindow(QMainWindow):
     ):
         super().__init__(parent)
         self.setWindowTitle("Internal Player")
-        self.setWindowIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.setWindowIcon(self._player_window_icon())
         self.resize(1080, 640)
 
         import vlc
@@ -569,7 +568,7 @@ class EmbeddedPlayerWindow(QMainWindow):
         self.title_label = QLabel("")
         self.title_label.setObjectName("titleLabel")
         self.title_label.setMinimumWidth(200)
-        self.btn_sidebar = QPushButton("☰")  # hamburger
+        self.btn_sidebar = QPushButton()
         self.btn_sidebar.setToolTip("Show/hide playlist (L)")
         self.btn_sidebar.clicked.connect(self.toggle_sidebar)
         top_lay = QHBoxLayout(self.top_bar)
@@ -850,6 +849,35 @@ class EmbeddedPlayerWindow(QMainWindow):
         painter.end()
         return QIcon(tinted)
 
+    @staticmethod
+    def _player_window_icon():
+        """Create a compact player icon that remains clear in the native caption."""
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor("#7c3aed"))
+        painter.setPen(Qt.NoPen)
+        painter.drawRoundedRect(2, 2, 20, 20, 5, 5)
+        painter.setBrush(Qt.white)
+        painter.drawPolygon(QPolygon([QPoint(9, 7), QPoint(9, 17), QPoint(17, 12)]))
+        painter.end()
+        return QIcon(pixmap)
+
+    @staticmethod
+    def _menu_icon(color):
+        """Draw a crisp menu symbol without relying on a platform glyph font."""
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(color, 2, Qt.SolidLine, Qt.RoundCap)
+        painter.setPen(pen)
+        for y in (7, 12, 17):
+            painter.drawLine(6, y, 18, y)
+        painter.end()
+        return QIcon(pixmap)
+
     def _set_standard_icon(self, button, standard_pixmap):
         button.setIcon(self._tinted_standard_icon(standard_pixmap))
 
@@ -880,6 +908,7 @@ class EmbeddedPlayerWindow(QMainWindow):
         )
         dark = luminance < 128
         self._icon_color = QColor("#f2f2f2" if dark else "#202020")
+        self.btn_sidebar.setIcon(self._menu_icon(self._icon_color))
         button_style = _DARK_BTN_STYLE if dark else _LIGHT_BTN_STYLE
         overlay_style = _DARK_OVERLAY_STYLE if dark else _LIGHT_OVERLAY_STYLE
         sidebar_style = _DARK_SIDEBAR_STYLE if dark else _LIGHT_SIDEBAR_STYLE
@@ -920,6 +949,21 @@ class EmbeddedPlayerWindow(QMainWindow):
                 )
                 if result == 0:
                     break
+
+            # Match the player's own header rather than the generic application
+            # background so the native and Qt title areas form one visual strip.
+            caption = QColor(20, 20, 22) if dark else QColor(245, 245, 245)
+            caption_color = ctypes.c_uint(
+                caption.red() | (caption.green() << 8) | (caption.blue() << 16)
+            )
+            text = QColor(242, 242, 242) if dark else QColor(32, 32, 32)
+            text_color = ctypes.c_uint(
+                text.red() | (text.green() << 8) | (text.blue() << 16)
+            )
+            for attribute, color in ((35, caption_color), (36, text_color)):
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attribute, ctypes.byref(color), ctypes.sizeof(color)
+                )
         except Exception:
             pass
 
@@ -958,6 +1002,9 @@ class EmbeddedPlayerWindow(QMainWindow):
             media.add_option(f":sub-language={self._subtitle_language}")
         self.player.set_media(media)
         self.show()
+        # Apply native caption colors after the HWND is visible because Windows
+        # may initialize its final non-client appearance during the first show.
+        self.apply_theme()
         self.raise_()
         self.activateWindow()
         self._bind_video_output()
@@ -1009,6 +1056,11 @@ class EmbeddedPlayerWindow(QMainWindow):
             return
         new = max(0, cur + ms)
         self.player.set_time(int(new))
+        seconds = abs(ms) / 1000
+        amount = f"{seconds:g}"
+        direction = "+" if ms >= 0 else "−"
+        unit = "second" if seconds == 1 else "seconds"
+        self._show_track_osd(f"{direction}{amount} {unit}")
         self._wake_controls()
 
     def set_volume(self, value):

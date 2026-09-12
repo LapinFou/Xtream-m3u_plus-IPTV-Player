@@ -38,7 +38,7 @@ from SearchUtils import normalize_search_text, title_matches_search
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher, AccountInfoWorker
 
-CURRENT_VERSION = "V2.01.14"
+CURRENT_VERSION = "V2.01.15"
 REMEMBER_CATEGORY_SORTING = "Remember per category"
 
 DEFAULT_INTERNAL_SEEK_STEP_SECONDS = 10
