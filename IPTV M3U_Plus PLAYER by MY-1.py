@@ -38,7 +38,7 @@ from SearchUtils import normalize_search_text, title_matches_search
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher, AccountInfoWorker
 
-CURRENT_VERSION = "V2.01.16"
+CURRENT_VERSION = "V2.01.17"
 REMEMBER_CATEGORY_SORTING = "Remember per category"
 
 DEFAULT_INTERNAL_SEEK_STEP_SECONDS = 10
@@ -88,6 +88,50 @@ def macos_bundle_executable(bundle_path):
     if not path.isfile(executable_path) or not os.access(executable_path, os.X_OK):
         raise OSError(f"The application bundle executable is unavailable: {executable_path}")
     return executable_path
+
+
+class KeyboardNavigableListWidget(QListWidget):
+    """Give catalog lists explicit keyboard activation and column switching."""
+
+    keyboardSelected = pyqtSignal(QListWidgetItem)
+    keyboardActivated = pyqtSignal(QListWidgetItem)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._tab_target = None
+
+    def setTabTarget(self, target):
+        self._tab_target = target
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            current_item = self.currentItem()
+            if current_item is not None:
+                self.keyboardActivated.emit(current_item)
+            event.accept()
+            return
+
+        if event.key() in (Qt.Key_Tab, Qt.Key_Backtab) and self._tab_target is not None:
+            if self._tab_target.currentItem() is None and self._tab_target.count():
+                self._tab_target.setCurrentRow(0)
+                self._tab_target.keyboardSelected.emit(self._tab_target.currentItem())
+            self._tab_target.setFocus(Qt.TabFocusReason)
+            event.accept()
+            return
+
+        navigation_keys = (
+            Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End,
+            Qt.Key_PageUp, Qt.Key_PageDown
+        )
+        if event.key() in navigation_keys:
+            previous_item = self.currentItem()
+            super().keyPressEvent(event)
+            current_item = self.currentItem()
+            if current_item is not None and current_item is not previous_item:
+                self.keyboardSelected.emit(current_item)
+            return
+
+        super().keyPressEvent(event)
 
 
 def private_url_log_reference(url):
@@ -682,11 +726,11 @@ class IPTVPlayerApp(QMainWindow):
         self.category_search_widgets = {}
         self.streaming_search_widgets = {}
 
-        #Create sorting all lists setting variable. Set sorting to A-Z by default.
-        self.sorting_enabled    = True
+        # Preserve the provider order until the user explicitly selects sorting.
+        self.sorting_enabled    = False
         self.sorting_order      = 0
         self.remember_category_sorting = False
-        self.category_sort_fallback = 'a_z'
+        self.category_sort_fallback = 'disabled'
         self.category_sort_preferences = {
             'LIVE': {},
             'Movies': {},
@@ -1812,9 +1856,9 @@ class IPTVPlayerApp(QMainWindow):
 
     def initCategoryListWidgets(self):
         #Create lists for categories
-        self.category_list_live     = QListWidget()
-        self.category_list_movies   = QListWidget()
-        self.category_list_series   = QListWidget()
+        self.category_list_live     = KeyboardNavigableListWidget()
+        self.category_list_movies   = KeyboardNavigableListWidget()
+        self.category_list_series   = KeyboardNavigableListWidget()
 
         #Enable sorting
         # self.category_list_live.setSortingEnabled(True)
@@ -1825,6 +1869,12 @@ class IPTVPlayerApp(QMainWindow):
         self.category_list_live.itemClicked.connect(self.category_item_clicked)
         self.category_list_movies.itemClicked.connect(self.category_item_clicked)
         self.category_list_series.itemClicked.connect(self.category_item_clicked)
+        self.category_list_live.keyboardActivated.connect(self.category_item_clicked)
+        self.category_list_movies.keyboardActivated.connect(self.category_item_clicked)
+        self.category_list_series.keyboardActivated.connect(self.category_item_clicked)
+        self.category_list_live.keyboardSelected.connect(self.category_item_clicked)
+        self.category_list_movies.keyboardSelected.connect(self.category_item_clicked)
+        self.category_list_series.keyboardSelected.connect(self.category_item_clicked)
 
         #Put category lists in list
         self.category_list_widgets = {
@@ -1855,9 +1905,9 @@ class IPTVPlayerApp(QMainWindow):
 
     def initEntryListWidgets(self):
         #Create lists for channels
-        self.streaming_list_live      = QListWidget()
-        self.streaming_list_movies    = QListWidget()
-        self.streaming_list_series    = QListWidget()
+        self.streaming_list_live      = KeyboardNavigableListWidget()
+        self.streaming_list_movies    = KeyboardNavigableListWidget()
+        self.streaming_list_series    = KeyboardNavigableListWidget()
 
         #Enable sorting
         # self.streaming_list_live.setSortingEnabled(True)
@@ -1882,12 +1932,26 @@ class IPTVPlayerApp(QMainWindow):
         self.streaming_list_movies.itemClicked.connect(self.streaming_item_clicked)
         self.streaming_list_series.itemClicked.connect(self.streaming_item_clicked)
 
+        self.streaming_list_live.keyboardActivated.connect(self.streaming_item_keyboard_activated)
+        self.streaming_list_movies.keyboardActivated.connect(self.streaming_item_keyboard_activated)
+        self.streaming_list_series.keyboardActivated.connect(self.streaming_item_keyboard_activated)
+        self.streaming_list_live.keyboardSelected.connect(self.streaming_item_clicked)
+        self.streaming_list_movies.keyboardSelected.connect(self.streaming_item_clicked)
+        self.streaming_list_series.keyboardSelected.connect(self.streaming_item_clicked)
+
         #Put entry lists in list
         self.streaming_list_widgets = {
             'LIVE': self.streaming_list_live,
             'Movies': self.streaming_list_movies,
             'Series': self.streaming_list_series,
         }
+
+        # Tab and Backtab switch directly between the two catalog columns.
+        for stream_type in ('LIVE', 'Movies', 'Series'):
+            category_list = self.category_list_widgets[stream_type]
+            streaming_list = self.streaming_list_widgets[stream_type]
+            category_list.setTabTarget(streaming_list)
+            streaming_list.setTabTarget(category_list)
 
         #Configure visuals of the lists
         standard_icon_size = QSize(24, 24)
@@ -1957,8 +2021,8 @@ class IPTVPlayerApp(QMainWindow):
         print(f"loading default sorting order: {sorting_order}")
 
         if not sorting_order:
-            #Set default order to A-Z
-            self.default_sorting_order_box.setCurrentText("A-Z")
+            # Keep the provider order for a new profile with no saved choice.
+            self.default_sorting_order_box.setCurrentText("Sorting disabled")
 
         else:
             self.default_sorting_order_box.setCurrentText(sorting_order)
@@ -2309,6 +2373,7 @@ class IPTVPlayerApp(QMainWindow):
         self.default_sorting_order_box.addItems([
             "A-Z", "Z-A", "Sorting disabled", REMEMBER_CATEGORY_SORTING
         ])
+        self.default_sorting_order_box.setCurrentText("Sorting disabled")
         self.default_sorting_order_box.currentTextChanged.connect(lambda e: self.setDefaultSortingOrder(e, self.default_sorting_order_box))
 
         self.update_checker = QPushButton("Check for updates")
@@ -2675,10 +2740,17 @@ class IPTVPlayerApp(QMainWindow):
             #carry a higher version number.
             if self._version_tuple(latest_version) > self._version_tuple(CURRENT_VERSION):
                 #If not up to date ask if user wants to go to download page
-                reply = QMessageBox.question(self, 'Update Available',
-                                             f"A new version ({latest_version}) is available.\n"
-                                             "Do you want to visit the download page?",
-                                             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                update_dialog = QMessageBox(self)
+                update_dialog.setIcon(QMessageBox.Question)
+                update_dialog.setWindowTitle('Update Available')
+                update_dialog.setText(
+                    f"A new version ({latest_version}) is available.\n"
+                    "Do you want to visit the download page?"
+                )
+                update_dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                update_dialog.setDefaultButton(QMessageBox.Yes)
+                self._prepare_dialog_theme(update_dialog)
+                reply = update_dialog.exec_()
 
                 #If user wants to go to download page, open latest version page
                 if reply == QMessageBox.Yes:
@@ -2688,7 +2760,13 @@ class IPTVPlayerApp(QMainWindow):
 
             #Current version is up to date
             elif enable_update_msg:
-                QMessageBox.information(self, 'No Update', "You are using the latest version.")
+                update_dialog = QMessageBox(self)
+                update_dialog.setIcon(QMessageBox.Information)
+                update_dialog.setWindowTitle('No Update')
+                update_dialog.setText("You are using the latest version.")
+                update_dialog.setStandardButtons(QMessageBox.Ok)
+                self._prepare_dialog_theme(update_dialog)
+                update_dialog.exec_()
 
             else:
                 self.animate_progress(0, 100, "No update available")
@@ -2697,7 +2775,13 @@ class IPTVPlayerApp(QMainWindow):
             print(f"Failed update checker: {e}")
 
             if enable_update_msg:
-                QMessageBox.warning(self, 'Failed update checker', "Failed checking for updates.\nPlease try again.")
+                update_dialog = QMessageBox(self)
+                update_dialog.setIcon(QMessageBox.Warning)
+                update_dialog.setWindowTitle('Failed update checker')
+                update_dialog.setText("Failed checking for updates.\nPlease try again.")
+                update_dialog.setStandardButtons(QMessageBox.Ok)
+                self._prepare_dialog_theme(update_dialog)
+                update_dialog.exec_()
             else:
                 self.animate_progress(0, 100, "Failed checking for updates", "error")
 
@@ -4242,6 +4326,11 @@ class IPTVPlayerApp(QMainWindow):
 
         except Exception as e:
             print(f"failed item double click: {e}")
+
+    def streaming_item_keyboard_activated(self, item):
+        """Apply the normal selection work, then open or play the chosen entry."""
+        self.streaming_item_clicked(item)
+        self.streaming_item_double_clicked(item)
 
     def go_back_to_level(self, series_navigation_level):
         self.set_progress_bar(0, "Loading items")

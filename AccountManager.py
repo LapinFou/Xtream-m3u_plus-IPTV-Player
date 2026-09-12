@@ -125,6 +125,7 @@ class AccountManager(QtWidgets.QDialog):
                 credentials = parts[1:]
 
                 dialog = AccountDialog(self, AccountDialog.MODE_EDIT, (method, name, *credentials))
+                self.parent._prepare_dialog_theme(dialog)
 
                 if dialog.exec_() == QtWidgets.QDialog.Accepted:
                     updated_method, updated_name, *updated_credentials = dialog.get_credentials()
@@ -142,6 +143,7 @@ class AccountManager(QtWidgets.QDialog):
 
     def add_account(self):
         dialog = AccountDialog(self, AccountDialog.MODE_ADD)
+        self.parent._prepare_dialog_theme(dialog)
 
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             method, name, *credentials = dialog.get_credentials()

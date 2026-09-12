@@ -91,7 +91,7 @@ REM Run PyInstaller directly with all necessary options and added data files
   --noconfirm ^
   --hidden-import vlc ^
   --icon "Images/TV_icon.ico" ^
-  --name "IPTV_Player" ^
+  --name "IPTV Player" ^
   --workpath %BUILD_PATH% ^
   --distpath %DIST_PATH% ^
   --add-data "Images/TV_icon.ico;Images" ^
@@ -133,7 +133,7 @@ REM Keep the lazy python-vlc import available in the diagnostic build too.
   --noconfirm ^
   --hidden-import vlc ^
   --icon "Images/TV_icon.ico" ^
-  --name "IPTV_Player_with_debug_console" ^
+  --name "IPTV Player with debug console" ^
   --workpath %BUILD_PATH% ^
   --distpath %DIST_PATH% ^
   --add-data "Images/TV_icon.ico;Images" ^
