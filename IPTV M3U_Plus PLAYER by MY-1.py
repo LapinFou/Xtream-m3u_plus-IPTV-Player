@@ -16,18 +16,18 @@ from lxml import etree, html
 from datetime import datetime
 from dateutil import parser, tz
 import xml.etree.ElementTree as ET
-from PyQt5.QtGui import QIcon, QFont, QImage, QPixmap, QColor, QDesktopServices, QIntValidator, QPalette
+from PyQt5.QtGui import QIcon, QFont, QImage, QPixmap, QColor, QDesktopServices, QIntValidator, QPalette, QPainter
 from PyQt5.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QObject, pyqtSignal, 
     QRunnable, pyqtSlot, QThreadPool, QModelIndex, QAbstractItemModel, QVariant,
-    QUrl, QByteArray
+    QUrl, QByteArray, QLocale
 )
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QLineEdit, QLabel, QPushButton,
     QListWidget, QWidget, QFileDialog, QCheckBox, QSizePolicy, QHBoxLayout,
     QDialog, QFormLayout, QDialogButtonBox, QTabWidget, QListWidgetItem,
-    QSpinBox, QMenu, QAction, QActionGroup, QTextEdit, QGridLayout, QMessageBox, QListView,
+    QSpinBox, QDoubleSpinBox, QMenu, QAction, QActionGroup, QTextEdit, QGridLayout, QMessageBox, QListView,
     QTreeWidget, QTreeWidgetItem, QTreeView, QAction, QMenu, QComboBox, QSplitter,
     QGroupBox, QRadioButton, QButtonGroup, QToolButton
 )
@@ -38,8 +38,20 @@ from SearchUtils import normalize_search_text, title_matches_search
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher, AccountInfoWorker
 
-CURRENT_VERSION = "V2.01.12"
+CURRENT_VERSION = "V2.01.14"
 REMEMBER_CATEGORY_SORTING = "Remember per category"
+
+DEFAULT_INTERNAL_SEEK_STEP_SECONDS = 10
+DEFAULT_INTERNAL_VOLUME_STEP_PERCENT = 2
+DEFAULT_INTERNAL_SPEED_STEP = 0.25
+MEDIA_LANGUAGE_OPTIONS = (
+    ("Arabic", "ara"), ("Chinese", "zho"), ("Dutch", "nld"),
+    ("English", "eng"), ("French", "fra"), ("German", "deu"),
+    ("Hindi", "hin"), ("Italian", "ita"), ("Japanese", "jpn"),
+    ("Korean", "kor"), ("Polish", "pol"), ("Portuguese", "por"),
+    ("Romanian", "ron"), ("Russian", "rus"), ("Spanish", "spa"),
+    ("Turkish", "tur"),
+)
 
 # CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
 # Increment the schema only when a release changes persisted data and add a matching,
@@ -69,6 +81,107 @@ class EmbeddedPlayerCommandBridge(QObject):
 
     command_received = pyqtSignal(dict)
     connection_closed = pyqtSignal()
+
+
+def is_system_dark(app):
+    """Return whether the operating-system application theme is dark."""
+    if is_windows:
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                return value == 0
+        except OSError:
+            return False
+    try:
+        background = app.palette().color(QPalette.Window)
+        # Use perceived luminance rather than assuming a platform-specific palette.
+        luminance = (
+            0.299 * background.red()
+            + 0.587 * background.green()
+            + 0.114 * background.blue()
+        )
+        return luminance < 128
+    except Exception:
+        return False
+
+
+def apply_application_theme(app, theme_name):
+    """Apply one shared palette to the main application and isolated player."""
+    selected_theme = theme_name if theme_name in ("System", "Light", "Dark") else "System"
+    dark = selected_theme == "Dark" or (
+        selected_theme == "System" and is_system_dark(app)
+    )
+    if dark:
+        palette = QPalette()
+        palette.setColor(QPalette.Window,          QColor(45, 45, 48))
+        palette.setColor(QPalette.WindowText,      Qt.white)
+        palette.setColor(QPalette.Base,            QColor(30, 30, 30))
+        palette.setColor(QPalette.AlternateBase,   QColor(45, 45, 48))
+        palette.setColor(QPalette.ToolTipBase,     QColor(45, 45, 48))
+        palette.setColor(QPalette.ToolTipText,     Qt.white)
+        palette.setColor(QPalette.Text,            Qt.white)
+        palette.setColor(QPalette.Button,          QColor(45, 45, 48))
+        palette.setColor(QPalette.ButtonText,      Qt.white)
+        palette.setColor(QPalette.BrightText,      Qt.red)
+        palette.setColor(QPalette.Link,            QColor(91, 141, 239))
+        palette.setColor(QPalette.Highlight,       QColor(91, 141, 239))
+        palette.setColor(QPalette.HighlightedText, Qt.black)
+        palette.setColor(QPalette.Disabled, QPalette.Text,       QColor(127, 127, 127))
+        palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(127, 127, 127))
+        app.setPalette(palette)
+    else:
+        app.setPalette(app.style().standardPalette())
+    return dark
+
+
+def apply_windows_title_bar_theme(widget, dark):
+    """Synchronize a native Windows title bar with the Qt application theme."""
+    if not is_windows:
+        return
+    try:
+        import ctypes
+        enabled = ctypes.c_int(1 if dark else 0)
+        hwnd = int(widget.winId())
+        # Attribute 20 is current; 19 supports older Windows 10 builds.
+        for attribute in (20, 19):
+            result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(enabled), ctypes.sizeof(enabled)
+            )
+            if result == 0:
+                break
+
+        # Windows can otherwise choose a slightly different caption tint for
+        # dialogs and main windows. Attributes 35 and 36 make every native title
+        # bar use the same Qt palette colors on supported Windows 11 versions.
+        caption = widget.palette().color(QPalette.Window)
+        caption_color = ctypes.c_uint(
+            caption.red() | (caption.green() << 8) | (caption.blue() << 16)
+        )
+        text = widget.palette().color(QPalette.WindowText)
+        text_color = ctypes.c_uint(
+            text.red() | (text.green() << 8) | (text.blue() << 16)
+        )
+        for attribute, color in ((35, caption_color), (36, text_color)):
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(color), ctypes.sizeof(color)
+            )
+    except Exception:
+        pass
+
+
+def application_palette_is_dark(app):
+    """Return whether the palette currently applied to Qt is dark."""
+    background = app.palette().color(QPalette.Window)
+    luminance = (
+        0.299 * background.red()
+        + 0.587 * background.green()
+        + 0.114 * background.blue()
+    )
+    return luminance < 128
 
 
 class NetworkSettingsDialog(QDialog):
@@ -279,6 +392,64 @@ class CategoryVisibilityDialog(QDialog):
         }
 
 
+class InternalPlayerSettingsDialog(QDialog):
+    """Edit keyboard, mouse, and transport steps for the internal player."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Internal player settings")
+        layout = QFormLayout(self)
+
+        self.seek_step = QSpinBox()
+        self.seek_step.setRange(1, 300)
+        self.seek_step.setSuffix(" seconds")
+        self.seek_step.setValue(parent.internal_seek_step_seconds)
+        self.seek_step.setToolTip("Amount used by seek buttons and Left/Right arrows")
+
+        self.volume_step = QSpinBox()
+        self.volume_step.setRange(1, 25)
+        self.volume_step.setSuffix(" %")
+        self.volume_step.setValue(parent.internal_volume_step_percent)
+        self.volume_step.setToolTip("Amount used by Up/Down arrows and the mouse wheel")
+
+        self.speed_step = QDoubleSpinBox()
+        self.speed_step.setRange(0.05, 1.00)
+        self.speed_step.setSingleStep(0.05)
+        self.speed_step.setDecimals(2)
+        self.speed_step.setSuffix("×")
+        # Keep the decimal separator consistent with the English-only interface
+        # and with the speed value displayed by the internal player.
+        self.speed_step.setLocale(QLocale.c())
+        self.speed_step.setValue(parent.internal_speed_step)
+        self.speed_step.setToolTip("Amount used by the slower/faster buttons and +/- keys")
+
+        self.audio_language = QComboBox()
+        self.audio_language.addItem("VLC default", "")
+        for language_name, language_code in MEDIA_LANGUAGE_OPTIONS:
+            self.audio_language.addItem(language_name, language_code)
+        audio_index = self.audio_language.findData(parent.internal_audio_language)
+        self.audio_language.setCurrentIndex(max(0, audio_index))
+
+        self.subtitle_language = QComboBox()
+        self.subtitle_language.addItem("VLC default", "")
+        self.subtitle_language.addItem("Disabled", "disabled")
+        for language_name, language_code in MEDIA_LANGUAGE_OPTIONS:
+            self.subtitle_language.addItem(language_name, language_code)
+        subtitle_index = self.subtitle_language.findData(parent.internal_subtitle_language)
+        self.subtitle_language.setCurrentIndex(max(0, subtitle_index))
+
+        layout.addRow("Seek step:", self.seek_step)
+        layout.addRow("Volume step:", self.volume_step)
+        layout.addRow("Playback speed step:", self.speed_step)
+        layout.addRow("Preferred audio:", self.audio_language)
+        layout.addRow("Preferred subtitles:", self.subtitle_language)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+
 class IPTVPlayerApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -313,6 +484,14 @@ class IPTVPlayerApp(QMainWindow):
         self._embedded_player_listener = None
         self._embedded_player_command_queue = None
         self._embedded_player_sender_thread = None
+
+        # These defaults are replaced by persisted values during startup and are
+        # sent to the isolated VLC process whenever it is started or reconfigured.
+        self.internal_seek_step_seconds = DEFAULT_INTERNAL_SEEK_STEP_SECONDS
+        self.internal_volume_step_percent = DEFAULT_INTERNAL_VOLUME_STEP_PERCENT
+        self.internal_speed_step = DEFAULT_INTERNAL_SPEED_STEP
+        self.internal_audio_language = ""
+        self.internal_subtitle_language = ""
         # Default values for URL formats
         self.default_url_formats = {
             'live': "{server}/live/{username}/{password}/{stream_id}.{container_extension}",
@@ -878,6 +1057,91 @@ class IPTVPlayerApp(QMainWindow):
         self.clear_btn_icon = QIcon(self.path_to_clear_btn_icon)
         self.go_back_icon   = QIcon(self.path_to_go_back_icon)
 
+    def _tinted_icon(self, source_icon, color):
+        """Create a monochrome copy of an icon that contrasts with the theme."""
+        source = source_icon.pixmap(24, 24)
+        tinted = QPixmap(source.size())
+        tinted.fill(Qt.transparent)
+        painter = QPainter(tinted)
+        painter.drawPixmap(0, 0, source)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        painter.fillRect(tinted.rect(), color)
+        painter.end()
+        return QIcon(tinted)
+
+    def _category_icon(self, color):
+        """Draw a transparent category grid using the current theme contrast."""
+        # Some native Qt list icons have an opaque background. Tinting such an
+        # icon colors its complete rectangle, so draw this simple symbol directly.
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        for x in (4, 13):
+            for y in (4, 13):
+                painter.fillRect(x, y, 7, 7, color)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _refresh_theme_icons(self, dark):
+        """Refresh monochrome icons after the application palette changes."""
+        color = QColor("#f2f2f2" if dark else "#202020")
+        themed_paths = {
+            'home_icon': self.path_to_home_icon,
+            'live_icon': self.path_to_live_icon,
+            'movies_icon': self.path_to_movies_icon,
+            'series_icon': self.path_to_series_icon,
+            'favorites_icon': self.path_to_favorites_icon,
+            'info_icon': self.path_to_info_icon,
+            'settings_icon': self.path_to_settings_icon,
+            'account_manager_icon': self.path_to_account_icon,
+            'mediaplayer_icon': self.path_to_mediaplayer_icon,
+            'search_icon': self.path_to_search_icon,
+            'sorting_icon': self.path_to_sorting_icon,
+            'clear_btn_icon': self.path_to_clear_btn_icon,
+            'go_back_icon': self.path_to_go_back_icon,
+        }
+        for attribute, icon_path in themed_paths.items():
+            setattr(self, attribute, self._tinted_icon(QIcon(icon_path), color))
+
+        if hasattr(self, 'tab_widget'):
+            tab_icons = {
+                'LIVE': self.live_icon,
+                'Movies': self.movies_icon,
+                'Series': self.series_icon,
+                'Info': self.info_icon,
+                'Settings': self.settings_icon,
+            }
+            for index in range(self.tab_widget.count()):
+                icon = tab_icons.get(self.tab_widget.tabText(index))
+                if icon is not None:
+                    self.tab_widget.setTabIcon(index, icon)
+
+        for search_bar in (
+            list(getattr(self, 'category_search_bars', {}).values())
+            + list(getattr(self, 'streaming_search_bars', {}).values())
+        ):
+            if hasattr(search_bar, 'search_action'):
+                search_bar.search_action.setIcon(self.search_icon)
+            if hasattr(search_bar, 'sort_button'):
+                search_bar.sort_button.setIcon(self.sorting_icon)
+            if hasattr(search_bar, 'clear_button'):
+                search_bar.clear_button.setIcon(self.clear_btn_icon)
+            if hasattr(search_bar, 'category_visibility_button'):
+                search_bar.category_visibility_button.setIcon(
+                    self._category_icon(color)
+                )
+
+        if hasattr(self, 'address_book_button'):
+            self.address_book_button.setIcon(self.account_manager_icon)
+        if hasattr(self, 'choose_player_button'):
+            self.choose_player_button.setIcon(self.mediaplayer_icon)
+
+    def statusPixmap(self, icon_path, width=24):
+        """Load a colored status circle without its legacy opaque white corners."""
+        pixmap = QPixmap(icon_path)
+        pixmap.setMask(pixmap.createMaskFromColor(QColor(Qt.white), Qt.MaskInColor))
+        return pixmap.scaledToWidth(width, Qt.SmoothTransformation)
+
     def initTabWidget(self):
         #Create tab widget
         self.tab_widget = QTabWidget()
@@ -946,7 +1210,9 @@ class IPTVPlayerApp(QMainWindow):
             sorting_action.setCheckable(True)
 
         #Add search icon
-        search_bar.addAction(self.search_icon, QLineEdit.LeadingPosition)
+        search_bar.search_action = search_bar.addAction(
+            self.search_icon, QLineEdit.LeadingPosition
+        )
 
         # Use a real tool button for the menu. A QAction embedded in QLineEdit may
         # consume the first click only to focus the editor on Windows, which makes
@@ -1021,7 +1287,10 @@ class IPTVPlayerApp(QMainWindow):
             category_visibility_button = QToolButton()
             category_visibility_button.setText("Categories")
             category_visibility_button.setIcon(
-                self.style().standardIcon(QtWidgets.QStyle.SP_FileDialogListView)
+                self._category_icon(
+                    QColor("#f2f2f2" if application_palette_is_dark(QtWidgets.qApp)
+                           else "#202020")
+                )
             )
             category_visibility_button.setToolButtonStyle(
                 Qt.ToolButtonTextBesideIcon
@@ -1059,6 +1328,7 @@ class IPTVPlayerApp(QMainWindow):
             categories,
             self.hidden_category_ids[stream_type]
         )
+        self._prepare_dialog_theme(dialog)
         if dialog.exec() != QDialog.Accepted:
             return
 
@@ -1478,9 +1748,17 @@ class IPTVPlayerApp(QMainWindow):
             list_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             list_widget.setIconSize(standard_icon_size)
             list_widget.setStyleSheet("""
+                QListWidget {
+                    background-color: palette(base);
+                    color: palette(text);
+                }
                 QListWidget::item {
                     padding-top: 5px;
                     padding-bottom: 5px;
+                }
+                QListWidget::item:selected {
+                    background-color: palette(highlight);
+                    color: palette(highlighted-text);
                 }
             """)
 
@@ -1526,9 +1804,17 @@ class IPTVPlayerApp(QMainWindow):
             list_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             list_widget.setIconSize(standard_icon_size)
             list_widget.setStyleSheet("""
+                QListWidget {
+                    background-color: palette(base);
+                    color: palette(text);
+                }
                 QListWidget::item {
                     padding-top: 5px;
                     padding-bottom: 5px;
+                }
+                QListWidget::item:selected {
+                    background-color: palette(highlight);
+                    color: palette(highlighted-text);
                 }
             """)
 
@@ -1876,15 +2162,28 @@ class IPTVPlayerApp(QMainWindow):
         self.choose_player_button.setToolTip("Select an external media player executable")
         self.choose_player_button.clicked.connect(self.choose_external_player)
 
+        self.internal_player_settings_button = QPushButton("Options…")
+        self.internal_player_settings_button.setToolTip(
+            "Configure seek, volume, and playback-speed steps"
+        )
+        self.internal_player_settings_button.setEnabled(False)
+        self.internal_player_settings_button.clicked.connect(
+            self.openInternalPlayerSettings
+        )
+
         self.current_player_label = QLabel("")
         self.current_player_label.setStyleSheet("color: #5b8def;")
 
         self.internal_player_radio.toggled.connect(
             lambda checked: self.use_embedded_player() if checked else None
         )
+        self.internal_player_radio.toggled.connect(
+            self.internal_player_settings_button.setEnabled
+        )
         self.external_player_radio.toggled.connect(self.use_external_player)
 
         self.player_group_layout.addWidget(self.internal_player_radio, 0, 0)
+        self.player_group_layout.addWidget(self.internal_player_settings_button, 0, 2)
         self.player_group_layout.addWidget(self.external_player_radio, 1, 0)
         self.player_group_layout.addWidget(self.external_player_path, 1, 1)
         self.player_group_layout.addWidget(self.choose_player_button, 1, 2)
@@ -2025,7 +2324,97 @@ class IPTVPlayerApp(QMainWindow):
 
     def openNetworkSettings(self):
         """Open the modal editor after all persisted network values are loaded."""
-        NetworkSettingsDialog(self).exec_()
+        dialog = NetworkSettingsDialog(self)
+        self._prepare_dialog_theme(dialog)
+        dialog.exec_()
+
+    def openInternalPlayerSettings(self):
+        """Edit and immediately apply the internal player's control steps."""
+        dialog = InternalPlayerSettingsDialog(self)
+        self._prepare_dialog_theme(dialog)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        self.internal_seek_step_seconds = dialog.seek_step.value()
+        self.internal_volume_step_percent = dialog.volume_step.value()
+        self.internal_speed_step = round(dialog.speed_step.value(), 2)
+        self.internal_audio_language = dialog.audio_language.currentData() or ""
+        self.internal_subtitle_language = dialog.subtitle_language.currentData() or ""
+        self.saveInternalPlayerSettings()
+
+        if self._embedded_player_command_queue is not None:
+            self._embedded_player_command_queue.put({
+                'command': 'control_steps',
+                'seek_seconds': self.internal_seek_step_seconds,
+                'volume_percent': self.internal_volume_step_percent,
+                'speed_step': self.internal_speed_step,
+                'audio_language': self.internal_audio_language,
+                'subtitle_language': self.internal_subtitle_language
+            })
+
+    def saveInternalPlayerSettings(self):
+        """Persist internal-player controls without replacing unrelated settings."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+        config['InternalPlayer'] = {
+            'seek_step_seconds': str(self.internal_seek_step_seconds),
+            'volume_step_percent': str(self.internal_volume_step_percent),
+            'speed_step': str(self.internal_speed_step),
+            'audio_language': self.internal_audio_language,
+            'subtitle_language': self.internal_subtitle_language
+        }
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+        except OSError as error:
+            print(f"Could not save internal player settings: {error}")
+
+    def loadDefaultInternalPlayerSettings(self):
+        """Load bounded control steps so manual INI edits remain safe."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+
+        try:
+            seek_seconds = config.getint(
+                'InternalPlayer', 'seek_step_seconds',
+                fallback=DEFAULT_INTERNAL_SEEK_STEP_SECONDS
+            )
+        except (ValueError, configparser.Error):
+            seek_seconds = DEFAULT_INTERNAL_SEEK_STEP_SECONDS
+        try:
+            volume_percent = config.getint(
+                'InternalPlayer', 'volume_step_percent',
+                fallback=DEFAULT_INTERNAL_VOLUME_STEP_PERCENT
+            )
+        except (ValueError, configparser.Error):
+            volume_percent = DEFAULT_INTERNAL_VOLUME_STEP_PERCENT
+        try:
+            speed_step = config.getfloat(
+                'InternalPlayer', 'speed_step',
+                fallback=DEFAULT_INTERNAL_SPEED_STEP
+            )
+        except (ValueError, configparser.Error):
+            speed_step = DEFAULT_INTERNAL_SPEED_STEP
+
+        self.internal_seek_step_seconds = max(1, min(seek_seconds, 300))
+        self.internal_volume_step_percent = max(1, min(volume_percent, 25))
+        self.internal_speed_step = max(0.05, min(round(speed_step, 2), 1.0))
+        valid_languages = {code for _, code in MEDIA_LANGUAGE_OPTIONS}
+        audio_language = config.get('InternalPlayer', 'audio_language', fallback='')
+        subtitle_language = config.get('InternalPlayer', 'subtitle_language', fallback='')
+        self.internal_audio_language = (
+            audio_language if audio_language in valid_languages else ''
+        )
+        self.internal_subtitle_language = (
+            subtitle_language
+            if subtitle_language in valid_languages | {'disabled'} else ''
+        )
 
     def applyNetworkSettings(self, user_agent, connection_timeout, read_timeout,
                              live_status_timeout, live_status_retries,
@@ -2244,6 +2633,9 @@ class IPTVPlayerApp(QMainWindow):
         )
 
     def loadDataAtStartup(self):
+        # Load internal-player steps before a startup account can launch media.
+        self.loadDefaultInternalPlayerSettings()
+
         #Load external media player
         self.external_player_command = self.load_external_player_command()
         self._refresh_current_player_label()
@@ -2332,55 +2724,38 @@ class IPTVPlayerApp(QMainWindow):
             self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
         self.show()
 
-    def _is_system_dark(self):
-        # On Windows 10/11, AppsUseLightTheme=0 means dark, 1 means light.
-        # Other OSes: fall back to checking the current palette's window-bg luminance.
-        if is_windows:
-            try:
-                import winreg
-                with winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER,
-                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-                ) as key:
-                    value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-                    return value == 0
-            except OSError:
-                return False
-        try:
-            app = QtWidgets.qApp
-            bg = app.palette().color(QPalette.Window)
-            # Rough perceived-luminance check.
-            return (0.299 * bg.red() + 0.587 * bg.green() + 0.114 * bg.blue()) < 128
-        except Exception:
-            return False
-
     def _apply_theme(self, theme_name):
-        # Theme names: "System", "Light", "Dark". Anything else falls back to System.
-        app = QtWidgets.qApp
-        if theme_name == "Dark" or (theme_name == "System" and self._is_system_dark()):
-            palette = QPalette()
-            palette.setColor(QPalette.Window,          QColor(45, 45, 48))
-            palette.setColor(QPalette.WindowText,      Qt.white)
-            palette.setColor(QPalette.Base,            QColor(30, 30, 30))
-            palette.setColor(QPalette.AlternateBase,   QColor(45, 45, 48))
-            palette.setColor(QPalette.ToolTipBase,     QColor(45, 45, 48))
-            palette.setColor(QPalette.ToolTipText,     Qt.white)
-            palette.setColor(QPalette.Text,            Qt.white)
-            palette.setColor(QPalette.Button,          QColor(45, 45, 48))
-            palette.setColor(QPalette.ButtonText,      Qt.white)
-            palette.setColor(QPalette.BrightText,      Qt.red)
-            palette.setColor(QPalette.Link,            QColor(91, 141, 239))
-            palette.setColor(QPalette.Highlight,       QColor(91, 141, 239))
-            palette.setColor(QPalette.HighlightedText, Qt.black)
-            palette.setColor(QPalette.Disabled, QPalette.Text,       QColor(127, 127, 127))
-            palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(127, 127, 127))
-            app.setPalette(palette)
-        else:
-            # Fusion's built-in light palette.
-            app.setPalette(app.style().standardPalette())
+        dark = apply_application_theme(QtWidgets.qApp, theme_name)
+        apply_windows_title_bar_theme(self, dark)
+        self._refresh_theme_icons(dark)
+        # Qt style-sheet palette references are resolved when the sheet is set.
+        # Reapply list sheets so switching Dark -> Light updates existing widgets.
+        list_widgets = (
+            list(getattr(self, 'category_list_widgets', {}).values())
+            + list(getattr(self, 'streaming_list_widgets', {}).values())
+        )
+        for list_widget in list_widgets:
+            style_sheet = list_widget.styleSheet()
+            list_widget.setStyleSheet("")
+            list_widget.setPalette(QtWidgets.qApp.palette())
+            list_widget.setStyleSheet(style_sheet)
+            list_widget.viewport().update()
+
+    def _prepare_dialog_theme(self, dialog):
+        """Apply the current palette and native title-bar theme to a dialog."""
+        dialog.setPalette(QtWidgets.qApp.palette())
+        apply_windows_title_bar_theme(
+            dialog, application_palette_is_dark(QtWidgets.qApp)
+        )
 
     def themeChanged(self, theme_name):
         self._apply_theme(theme_name)
+        # Keep an already-open isolated player synchronized with Settings.
+        if self._embedded_player_command_queue is not None:
+            self._embedded_player_command_queue.put({
+                'command': 'theme',
+                'theme': theme_name
+            })
         config = configparser.ConfigParser()
         try:
             config.read(self.user_data_file)
@@ -2420,7 +2795,7 @@ class IPTVPlayerApp(QMainWindow):
             self.live_info_box.stream_status.setVisible(self.stream_status_enabled)
             if not self.stream_status_enabled:
                 self.live_info_box.stream_status.setPixmap(
-                    QPixmap(self.path_to_unknown_status_icon).scaledToWidth(24)
+                    self.statusPixmap(self.path_to_unknown_status_icon, 24)
                 )
         except Exception:
             pass
@@ -3312,9 +3687,13 @@ class IPTVPlayerApp(QMainWindow):
 
             self.set_progress_bar(0, "Loading items")
 
+            was_nested_series_view = (
+                stream_type == 'Series' and self.series_navigation_level != 0
+            )
             if stream_type == 'Series':
-                #Reset navigation level
+                # A category selection always starts at the series-list root.
                 self.series_navigation_level = 0
+                self.prev_double_clicked_streaming_item = 0
 
             is_favorites_view = (selected_item_text == self.fav_categories_text)
 
@@ -3341,7 +3720,11 @@ class IPTVPlayerApp(QMainWindow):
             try:
                 active_view_key = self.active_category_view_key.get(stream_type)
                 search_is_empty = not self.streaming_search_bars[stream_type].text()
-                if active_view_key is not None and search_is_empty:
+                if (
+                    active_view_key is not None
+                    and search_is_empty
+                    and not was_nested_series_view
+                ):
                     # Detach from the end so row removal stays O(n), then restore the
                     # original order before storing the reusable item objects.
                     detached_items = [
@@ -3351,8 +3734,8 @@ class IPTVPlayerApp(QMainWindow):
                     detached_items.reverse()
                     self.category_item_cache[stream_type][active_view_key] = detached_items
                 else:
-                    # Search results and stale Favorites views must never replace a
-                    # complete cached category view.
+                    # Search results and nested Series rows must never replace a
+                    # complete cached category root view.
                     list_widget.clear()
 
                 cached_items = self.category_item_cache[stream_type].pop(
@@ -3402,7 +3785,9 @@ class IPTVPlayerApp(QMainWindow):
         print(f"Failed processing streaming status: {error_msg}")
 
         #Set stream status to unknown
-        self.live_info_box.stream_status.setPixmap(QPixmap(self.path_to_unknown_status_icon).scaledToWidth(24))
+        self.live_info_box.stream_status.setPixmap(
+            self.statusPixmap(self.path_to_unknown_status_icon, 24)
+        )
 
     def ProcessStreamStatus(self, stream_id, stream_status):
         try:
@@ -3412,11 +3797,17 @@ class IPTVPlayerApp(QMainWindow):
                 return
 
             if (stream_status == "True"):
-                self.live_info_box.stream_status.setPixmap(QPixmap(self.path_to_online_status_icon).scaledToWidth(24))
+                self.live_info_box.stream_status.setPixmap(
+                    self.statusPixmap(self.path_to_online_status_icon, 24)
+                )
             elif (stream_status == "Maybe"):
-                self.live_info_box.stream_status.setPixmap(QPixmap(self.path_to_maybe_status_icon).scaledToWidth(24))
+                self.live_info_box.stream_status.setPixmap(
+                    self.statusPixmap(self.path_to_maybe_status_icon, 24)
+                )
             else:
-                self.live_info_box.stream_status.setPixmap(QPixmap(self.path_to_offline_status_icon).scaledToWidth(24))
+                self.live_info_box.stream_status.setPixmap(
+                    self.statusPixmap(self.path_to_offline_status_icon, 24)
+                )
         except Exception as e:
             print(f"Failed processing streaming status: {e}")
 
@@ -3551,7 +3942,9 @@ class IPTVPlayerApp(QMainWindow):
                 self.live_info_box.EPG_box_label.setText(f"{clicked_item_data['name']}")
 
                 #Clear Stream Status indicator
-                self.live_info_box.stream_status.setPixmap(QPixmap(self.path_to_unknown_status_icon).scaledToWidth(25))
+                self.live_info_box.stream_status.setPixmap(
+                    self.statusPixmap(self.path_to_unknown_status_icon, 25)
+                )
 
                 #Clear EPG data
                 self.live_info_box.live_EPG_info.clear()
@@ -4022,6 +4415,9 @@ class IPTVPlayerApp(QMainWindow):
         external_mode = self.external_player_radio.isChecked()
         self.external_player_path.setEnabled(external_mode)
         self.choose_player_button.setEnabled(external_mode)
+        self.internal_player_settings_button.setEnabled(
+            self.internal_player_radio.isChecked()
+        )
 
     def _play_embedded(self, url):
         try:
@@ -4071,6 +4467,12 @@ class IPTVPlayerApp(QMainWindow):
         environment['IPTV_PLAYER_IPC_FAMILY'] = family
         environment['IPTV_PLAYER_IPC_AUTH'] = auth_key.hex()
         environment['IPTV_PLAYER_USER_AGENT'] = self.current_user_agent or ''
+        environment['IPTV_PLAYER_THEME'] = self.theme_select_box.currentText()
+        environment['IPTV_PLAYER_SEEK_STEP'] = str(self.internal_seek_step_seconds)
+        environment['IPTV_PLAYER_VOLUME_STEP'] = str(self.internal_volume_step_percent)
+        environment['IPTV_PLAYER_SPEED_STEP'] = str(self.internal_speed_step)
+        environment['IPTV_PLAYER_AUDIO_LANGUAGE'] = self.internal_audio_language
+        environment['IPTV_PLAYER_SUBTITLE_LANGUAGE'] = self.internal_subtitle_language
         environment['IPTV_PLAYER_VOLUME_FILE'] = path.abspath(
             path.join(path.dirname(self.user_data_file), '.embedded_player_volume')
         )
@@ -4467,6 +4869,7 @@ class IPTVPlayerApp(QMainWindow):
 
     def open_address_book(self):
         dialog = AccountManager(self)
+        self._prepare_dialog_theme(dialog)
         dialog.exec_()
 
 def _install_logging():
@@ -4571,10 +4974,38 @@ def _run_embedded_player_process():
     # Do not expose the private child-mode argument to Qt's option parser.
     app = QApplication([sys.argv[0]])
     _configure_qt_application(app)
+    apply_application_theme(app, os.environ.get('IPTV_PLAYER_THEME', 'System'))
+
+    # Environment values originate from bounded application settings, but parse
+    # defensively so a manually launched child still receives safe defaults.
+    try:
+        seek_step = max(1, min(int(os.environ.get(
+            'IPTV_PLAYER_SEEK_STEP', DEFAULT_INTERNAL_SEEK_STEP_SECONDS
+        )), 300))
+    except ValueError:
+        seek_step = DEFAULT_INTERNAL_SEEK_STEP_SECONDS
+    try:
+        volume_step = max(1, min(int(os.environ.get(
+            'IPTV_PLAYER_VOLUME_STEP', DEFAULT_INTERNAL_VOLUME_STEP_PERCENT
+        )), 25))
+    except ValueError:
+        volume_step = DEFAULT_INTERNAL_VOLUME_STEP_PERCENT
+    try:
+        speed_step = max(0.05, min(float(os.environ.get(
+            'IPTV_PLAYER_SPEED_STEP', DEFAULT_INTERNAL_SPEED_STEP
+        )), 1.0))
+    except ValueError:
+        speed_step = DEFAULT_INTERNAL_SPEED_STEP
+
     player = EmbeddedPlayerWindow(
         None,
         user_agent=os.environ.get('IPTV_PLAYER_USER_AGENT', ''),
-        volume_pref_path=os.environ.get('IPTV_PLAYER_VOLUME_FILE') or None
+        volume_pref_path=os.environ.get('IPTV_PLAYER_VOLUME_FILE') or None,
+        seek_step_seconds=seek_step,
+        volume_step_percent=volume_step,
+        speed_step=speed_step,
+        audio_language=os.environ.get('IPTV_PLAYER_AUDIO_LANGUAGE', ''),
+        subtitle_language=os.environ.get('IPTV_PLAYER_SUBTITLE_LANGUAGE', '')
     )
     bridge = EmbeddedPlayerCommandBridge()
 
@@ -4589,6 +5020,19 @@ def _run_embedded_player_process():
         elif payload.get('command') == 'quit':
             player.close()
             app.quit()
+        elif payload.get('command') == 'theme':
+            apply_application_theme(app, payload.get('theme', 'System'))
+            player.apply_theme()
+        elif payload.get('command') == 'control_steps':
+            player.set_control_steps(
+                payload.get('seek_seconds', DEFAULT_INTERNAL_SEEK_STEP_SECONDS),
+                payload.get('volume_percent', DEFAULT_INTERNAL_VOLUME_STEP_PERCENT),
+                payload.get('speed_step', DEFAULT_INTERNAL_SPEED_STEP)
+            )
+            player.set_track_preferences(
+                payload.get('audio_language', ''),
+                payload.get('subtitle_language', '')
+            )
 
     bridge.command_received.connect(handle_command)
     bridge.connection_closed.connect(app.quit)
