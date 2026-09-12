@@ -161,7 +161,7 @@ If none of these work, more attention is needed and you should create an [Issues
 python -m pip install --upgrade pip
 python -m pip install --upgrade setuptools
 python -m pip install --upgrade pyinstaller
-python -m pip install --upgrade requests lxml python-dateutil PyQt5
+python -m pip install -r requirements.txt
 ```
 
 ### 3. Verify that PyInstaller is installed correctly
@@ -189,7 +189,7 @@ If you are building Python by yourself, rebuild with `--enable-shared` (or, `--e
 python3 -m pip install --upgrade pip
 python3 -m pip install --upgrade setuptools
 python3 -m pip install --upgrade pyinstaller
-python3 -m pip install --upgrade requests lxml python-dateutil PyQt5
+python3 -m pip install -r requirements.txt
 ```
 _Note:_ If you are not logged in as root (which is recommended), you need to ensure that `pyInstaller` is included in your PATH environment variable:
 ```bash
@@ -218,7 +218,7 @@ pyinstaller --version
 
 ```bash
 python3 -m pip install --upgrade pip setuptools pyinstaller
-python3 -m pip install --upgrade requests lxml python-dateutil PyQt5
+python3 -m pip install -r requirements.txt
 ```
 
 ### 3. Build the application
@@ -226,12 +226,14 @@ python3 -m pip install --upgrade requests lxml python-dateutil PyQt5
 `chmod +x build_IPTV_Player_macOS.sh`
 - Run [./build_IPTV_Player_macOS.sh](build_IPTV_Player_macOS.sh).
 - The generated application is written to `dist/IPTV Player.app`.
+- A versioned `dist/IPTV Player Vx.x.x.dmg` release package is also created.
 
 ### 4. Install the application
-- Open the `dist` folder in Finder.
-- Drag `IPTV Player.app` into the macOS `Applications` folder.
+- Open the generated `.dmg` file.
+- Drag `IPTV Player.app` onto the `Applications` shortcut.
 - The build script removes PyInstaller's duplicate executable folder after the
-  `.app` bundle has been created, so `dist` contains only the application to install.
+  `.app` bundle has been created. The `dist` folder contains the application for
+  local testing and the `.dmg` file for distribution.
 - On first launch, macOS may require Control-clicking the application and choosing
   **Open** because the application is not code-signed.
 

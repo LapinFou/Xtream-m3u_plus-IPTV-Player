@@ -1,55 +1,60 @@
 @echo off
-REM Set the path to PyInstaller executable (if pyinstaller is in PATH, just use "pyinstaller")
-SET PYINSTALLER=python -m PyInstaller
+SET PYTHON_BIN=
 
 cls
 echo ===============================
-echo Set PyInstaller command:
+echo Select the Python interpreter:
 echo.
-echo 1. python -m PyInstaller
-echo 2. python -m pyinstaller
-echo 3. PyInstaller
-echo 4. pyinstaller
+echo 1. python
+echo 2. py -3
 echo ===============================
-set /p py_choice=Enter your choice (1, 2, 3 or 4): 
+set /p py_choice=Enter your choice (1 or 2):
 
-IF "%py_choice%"=="1" SET PYINSTALLER=python -m PyInstaller
-IF "%py_choice%"=="2" SET PYINSTALLER=python -m pyinstaller
-IF "%py_choice%"=="3" SET PYINSTALLER=PyInstaller
-IF "%py_choice%"=="4" SET PYINSTALLER=pyinstaller
+IF "%py_choice%"=="1" SET PYTHON_BIN=python
+IF "%py_choice%"=="2" SET PYTHON_BIN=py -3
+IF NOT DEFINED PYTHON_BIN (
+  echo ERROR: Invalid Python selection.
+  pause
+  exit /b 1
+)
 
-REM Show version
+REM Use the selected interpreter for dependency checks and the build.
 echo.
-echo PyInstaller version: 
-%PYINSTALLER% --version
-
-REM The embedded player imports python-vlc lazily, so verify the binding explicitly.
-REM Install it only when missing to keep normal rebuilds fast and offline-friendly.
-python -c "import vlc" >nul 2>&1
+echo PyInstaller version:
+%PYTHON_BIN% -m PyInstaller --version
 IF ERRORLEVEL 1 (
   echo.
-  echo python-vlc is missing. Installing the required VLC Python binding...
-  python -m pip install "python-vlc>=3.0.20000"
+  echo ERROR: PyInstaller is unavailable for the selected Python interpreter.
+  echo Install it with: %PYTHON_BIN% -m pip install pyinstaller
+  pause
+  exit /b 1
+)
+
+REM Every dependency must belong to the interpreter used for packaging.
+%PYTHON_BIN% -c "import PyQt5, requests, lxml, dateutil, vlc" >nul 2>&1
+IF ERRORLEVEL 1 (
+  echo.
+  echo Installing missing application dependencies...
+  %PYTHON_BIN% -m pip install -r requirements.txt
   IF ERRORLEVEL 1 (
     echo.
-    echo ERROR: python-vlc could not be installed. The build has been cancelled.
+    echo ERROR: Application dependencies could not be installed.
     echo Check your Internet connection and Python installation, then try again.
     pause
     exit /b 1
   )
 )
 
-REM Confirm that the module is importable before PyInstaller deletes older builds.
-python -c "import vlc" >nul 2>&1
+REM Confirm all modules can be collected before deleting previous builds.
+%PYTHON_BIN% -c "import PyQt5, requests, lxml, dateutil, vlc" >nul 2>&1
 IF ERRORLEVEL 1 (
   echo.
-  echo ERROR: python-vlc is still unavailable. The build has been cancelled.
+  echo ERROR: Required Python modules are still unavailable. Build cancelled.
   pause
   exit /b 1
 )
 
-echo python-vlc is available.
-pause
+echo Application dependencies are available.
 
 REM Main Python script to package
 SET MAIN_SCRIPT="IPTV M3U_Plus PLAYER by MY-1.py"
@@ -85,7 +90,7 @@ IF "%exec_choice%"=="2" GOTO option2
 
 REM python-vlc is imported lazily, so PyInstaller cannot discover it automatically.
 REM Run PyInstaller directly with all necessary options and added data files
-%PYINSTALLER% ^
+%PYTHON_BIN% -m PyInstaller ^
   --onefile ^
   --noconsole ^
   --noconfirm ^
@@ -128,7 +133,7 @@ IF "%exec_choice%"=="1" GOTO end
 :option2
 REM Create executable with debug console
 REM Keep the lazy python-vlc import available in the diagnostic build too.
-%PYINSTALLER% ^
+%PYTHON_BIN% -m PyInstaller ^
   --onefile ^
   --noconfirm ^
   --hidden-import vlc ^

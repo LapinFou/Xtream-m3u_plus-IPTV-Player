@@ -7,8 +7,7 @@ Raw IPTV data/
 all_cached_data.json
 userdata.ini
 build/
-IPTV_Player.spec
-IPTV_Player_with_debug_console.spec
+*.spec
 lib/
 IPTV screenshots/
 favorites.json

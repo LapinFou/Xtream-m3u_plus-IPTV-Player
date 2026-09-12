@@ -12,6 +12,8 @@ PYTHON_BIN=python3
 MAIN_SCRIPT="IPTV M3U_Plus PLAYER by MY-1.py"
 BUILD_PATH="build"
 DIST_PATH="dist"
+APP_NAME="IPTV Player"
+APP_PATH="$DIST_PATH/$APP_NAME.app"
 
 # PyInstaller and every application dependency must belong to the interpreter
 # used for packaging. PyInstaller can otherwise finish with a broken bundle.
@@ -114,17 +116,39 @@ fi
 
 # The .app bundle contains its own complete copy. Keep only the artifact users
 # install, after confirming that PyInstaller created it successfully.
-if [ ! -d "$DIST_PATH/IPTV Player.app" ]; then
+if [ ! -d "$APP_PATH" ]; then
   echo "ERROR: The macOS application bundle was not created."
   exit 1
 fi
-if [ -d "$DIST_PATH/IPTV Player" ]; then
-  echo "Removing duplicate PyInstaller folder: $DIST_PATH/IPTV Player"
-  rm -rf "$DIST_PATH/IPTV Player"
+if [ -d "$DIST_PATH/$APP_NAME" ]; then
+  echo "Removing duplicate PyInstaller folder: $DIST_PATH/$APP_NAME"
+  rm -rf "$DIST_PATH/$APP_NAME"
 fi
 
+# Create a compressed disk image suitable for a GitHub release. The Applications
+# shortcut lets users install the app with the usual drag-and-drop gesture.
+APP_VERSION=$(sed -n 's/^CURRENT_VERSION = "\([^"]*\)"/\1/p' "$MAIN_SCRIPT" | head -n 1)
+if [ -z "$APP_VERSION" ]; then
+  echo "ERROR: Could not read CURRENT_VERSION from $MAIN_SCRIPT."
+  exit 1
+fi
+
+DMG_STAGE="$BUILD_PATH/dmg"
+DMG_PATH="$DIST_PATH/$APP_NAME $APP_VERSION.dmg"
+rm -rf "$DMG_STAGE"
+mkdir -p "$DMG_STAGE"
+cp -R "$APP_PATH" "$DMG_STAGE/"
+ln -s /Applications "$DMG_STAGE/Applications"
+hdiutil create \
+  -volname "$APP_NAME" \
+  -srcfolder "$DMG_STAGE" \
+  -ov \
+  -format UDZO \
+  "$DMG_PATH"
+
 echo
-echo "Build completed: $DIST_PATH/IPTV Player.app"
-echo "Launch with: open '$DIST_PATH/IPTV Player.app'"
+echo "Build completed: $APP_PATH"
+echo "Release package: $DMG_PATH"
+echo "Launch with: open '$APP_PATH'"
 echo "If Finder shows no error, diagnose with:"
-echo "'$DIST_PATH/IPTV Player.app/Contents/MacOS/IPTV Player'"
+echo "'$APP_PATH/Contents/MacOS/$APP_NAME'"

@@ -18,23 +18,22 @@ if ! "$PYTHON_BIN" -m PyInstaller --version &> /dev/null; then
   exit 1
 fi
 
-# The internal player imports python-vlc lazily, so verify the binding explicitly.
-# Install it only when missing to keep normal rebuilds fast and offline-friendly.
-if ! "$PYTHON_BIN" -c "import vlc" &> /dev/null; then
-  echo "python-vlc is missing. Installing the required VLC Python binding..."
-  if ! "$PYTHON_BIN" -m pip install "python-vlc>=3.0.20000"; then
-    echo "ERROR: python-vlc could not be installed. The build has been cancelled."
+# Every dependency must belong to the interpreter used for packaging.
+if ! "$PYTHON_BIN" -c "import PyQt5, requests, lxml, dateutil, vlc" &> /dev/null; then
+  echo "Installing missing application dependencies..."
+  if ! "$PYTHON_BIN" -m pip install -r requirements.txt; then
+    echo "ERROR: Application dependencies could not be installed."
     exit 1
   fi
 fi
 
-# Confirm the lazy module can be collected before deleting previous builds.
-if ! "$PYTHON_BIN" -c "import vlc" &> /dev/null; then
-  echo "ERROR: python-vlc is still unavailable. The build has been cancelled."
+# Confirm all modules can be collected before deleting previous builds.
+if ! "$PYTHON_BIN" -c "import PyQt5, requests, lxml, dateutil, vlc" &> /dev/null; then
+  echo "ERROR: Required Python modules are still unavailable. Build cancelled."
   exit 1
 fi
 
-echo "python-vlc is available."
+echo "Application dependencies are available."
 
 # Set variables
 MAIN_SCRIPT="IPTV M3U_Plus PLAYER by MY-1.py"
@@ -59,8 +58,8 @@ fi
   --noconsole \
   --noconfirm \
   --hidden-import vlc \
-  --icon "Images/TV_icon.ico" \
-  --name "IPTV_Player" \
+  --icon "Images/TV_icon.png" \
+  --name "IPTV Player" \
   --distpath "$DIST_PATH" \
   --workpath "$BUILD_PATH" \
   --add-data "Images/TV_icon.ico:Images" \
@@ -93,4 +92,4 @@ fi
   "$MAIN_SCRIPT"
 
 echo
-echo -e "\u2714 Build completed. The executable is in the folder $DIST_PATH."
+echo "Build completed: $DIST_PATH/IPTV Player"
