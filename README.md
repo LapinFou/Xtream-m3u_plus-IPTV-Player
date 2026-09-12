@@ -172,7 +172,7 @@ pyinstaller --version
 ```
 
 ### 4. Final Setup
-- Run the [build_iptv_player.bat](build_iptv_player.bat) file to start the process.
+- Run the [build_IPTV_Player_Win.bat](build_IPTV_Player_Win.bat) file to start the process.
 
 ## Rocky9/RHEL9 Project Setup Instructions
 
@@ -205,8 +205,8 @@ pyinstaller --version
 
 ### 4. Final Setup
 - Make the SH script executable with the command:\
-`chmod +x build_iptv_player.sh`
-- Run the [./build_iptv_player.sh](build_iptv_player.sh) file to start the process.
+`chmod +x build_IPTV_Player_Linux.sh`
+- Run the [./build_IPTV_Player_Linux.sh](build_IPTV_Player_Linux.sh) file to start the process.
 
 ## macOS Project Setup Instructions
 
@@ -223,8 +223,8 @@ python3 -m pip install --upgrade requests lxml python-dateutil PyQt5
 
 ### 3. Build the application
 - Make the macOS script executable with the command:\
-`chmod +x build_iptv_player_macos.sh`
-- Run [./build_iptv_player_macos.sh](build_iptv_player_macos.sh).
-- The generated application is written to the `dist` folder.
+`chmod +x build_IPTV_Player_macOS.sh`
+- Run [./build_IPTV_Player_macOS.sh](build_IPTV_Player_macOS.sh).
+- The generated application is written to `dist/IPTV_Player.app`.
 
 </details>

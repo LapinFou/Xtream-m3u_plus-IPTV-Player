@@ -13,18 +13,24 @@ MAIN_SCRIPT="IPTV M3U_Plus PLAYER by MY-1.py"
 BUILD_PATH="build"
 DIST_PATH="dist"
 
-# PyInstaller and python-vlc must belong to the interpreter used for packaging.
+# PyInstaller and every application dependency must belong to the interpreter
+# used for packaging. PyInstaller can otherwise finish with a broken bundle.
 if ! "$PYTHON_BIN" -m PyInstaller --version >/dev/null 2>&1; then
   echo "PyInstaller not found. Please install it with '$PYTHON_BIN -m pip install pyinstaller'"
   exit 1
 fi
 
-if ! "$PYTHON_BIN" -c "import vlc" >/dev/null 2>&1; then
-  echo "python-vlc is missing. Installing the required VLC Python binding..."
-  if ! "$PYTHON_BIN" -m pip install "python-vlc>=3.0.20000"; then
-    echo "ERROR: python-vlc could not be installed. The build has been cancelled."
+if ! "$PYTHON_BIN" -c "import PyQt5, requests, lxml, dateutil, vlc" >/dev/null 2>&1; then
+  echo "Installing missing application dependencies..."
+  if ! "$PYTHON_BIN" -m pip install -r requirements.txt; then
+    echo "ERROR: Application dependencies could not be installed."
     exit 1
   fi
+fi
+
+if ! "$PYTHON_BIN" -c "import PyQt5, requests, lxml, dateutil, vlc" >/dev/null 2>&1; then
+  echo "ERROR: Required Python modules are still unavailable. Build cancelled."
+  exit 1
 fi
 
 # python-vlc is only a binding. The VLC application supplies libVLC at runtime.
@@ -50,10 +56,11 @@ if [ -d "$DIST_PATH" ]; then
   rm -rf "$DIST_PATH"
 fi
 
-# Explicitly collect vlc because the internal player imports it lazily.
+# Keep the packaged files visible inside the macOS application bundle. This
+# makes startup more direct and missing runtime dependencies easier to diagnose.
 "$PYTHON_BIN" -m PyInstaller \
   --clean \
-  --onefile \
+  --onedir \
   --windowed \
   --noconfirm \
   --hidden-import vlc \
@@ -91,4 +98,7 @@ fi
   "$MAIN_SCRIPT"
 
 echo
-echo "Build completed. The macOS application is in $DIST_PATH."
+echo "Build completed: $DIST_PATH/IPTV_Player.app"
+echo "Launch with: open '$DIST_PATH/IPTV_Player.app'"
+echo "If Finder shows no error, diagnose with:"
+echo "'$DIST_PATH/IPTV_Player.app/Contents/MacOS/IPTV_Player'"
