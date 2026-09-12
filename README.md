@@ -57,6 +57,37 @@ Download the latest version here: [Latest releases](https://github.com/Youri666/
 - **Improve startup loading time:** Improve loading time at startup by optionally loading the IPTV data from cache.
 - **Dark theme**
 
+## Configuration migrations
+
+`userdata.ini` records the version of its persisted-data schema:
+
+```ini
+[Application]
+config_schema_version = 1
+```
+
+`config_schema_version` identifies the structure and meaning of the persisted data.
+When a major or minor update changes that structure, the application can compare this
+number with `CURRENT_CONFIG_SCHEMA_VERSION` and apply every missing migration in order.
+For example, schema 1 converts the former combined `VOD` option into independent LIVE,
+Movies, and Series options while preserving the user's previous choice.
+
+This value is deliberately separate from `CURRENT_VERSION`. The application version
+is already compiled into the executable and is used by the GitHub update checker;
+storing it again in `userdata.ini` would be redundant. Most application releases do
+not change the configuration schema.
+
+When adding a configuration migration:
+
+1. Increment `CURRENT_CONFIG_SCHEMA_VERSION`.
+2. Add an ordered `if stored_schema_version < N` block to `updateUserDataFile()`.
+3. Make the migration safe to run repeatedly and preserve existing user preferences.
+4. Update the stored schema marker only after the migration blocks have completed.
+
+The loader preserves a schema number newer than the current application understands.
+This prevents an older build from incorrectly marking a future configuration as an
+older schema.
+
 <details>
 <summary><h1><strong>FAQ</strong></h1></summary>
 
@@ -130,7 +161,7 @@ If none of these work, more attention is needed and you should create an [Issues
 python -m pip install --upgrade pip
 python -m pip install --upgrade setuptools
 python -m pip install --upgrade pyinstaller
-python -m pip install --upgrade requests lxml python-dateutil PyQt5
+python -m pip install -r requirements.txt
 ```
 
 ### 3. Verify that PyInstaller is installed correctly
@@ -141,7 +172,7 @@ pyinstaller --version
 ```
 
 ### 4. Final Setup
-- Run the [build_iptv_player.bat](build_iptv_player.bat) file to start the process.
+- Run the [build_IPTV_Player_Win.bat](build_IPTV_Player_Win.bat) file to start the process.
 
 ## Rocky9/RHEL9 Project Setup Instructions
 
@@ -158,7 +189,7 @@ If you are building Python by yourself, rebuild with `--enable-shared` (or, `--e
 python3 -m pip install --upgrade pip
 python3 -m pip install --upgrade setuptools
 python3 -m pip install --upgrade pyinstaller
-python3 -m pip install --upgrade requests lxml python-dateutil PyQt5
+python3 -m pip install -r requirements.txt
 ```
 _Note:_ If you are not logged in as root (which is recommended), you need to ensure that `pyInstaller` is included in your PATH environment variable:
 ```bash
@@ -174,7 +205,36 @@ pyinstaller --version
 
 ### 4. Final Setup
 - Make the SH script executable with the command:\
-`chmod +x build_iptv_player.sh`
-- Run the [./build_iptv_player.sh](build_iptv_player.sh) file to start the process.
+`chmod +x build_IPTV_Player_Linux.sh`
+- Run the [./build_IPTV_Player_Linux.sh](build_IPTV_Player_Linux.sh) file to start the process.
+
+## macOS Project Setup Instructions
+
+### 1. Install the required applications
+- Install the latest Python 3 from [python.org](https://www.python.org/downloads/macos/).
+- Install the latest VLC from [videolan.org](https://www.videolan.org/vlc/) in `/Applications`.
+
+### 2. Install the build dependencies
+
+```bash
+python3 -m pip install --upgrade pip setuptools pyinstaller
+python3 -m pip install -r requirements.txt
+```
+
+### 3. Build the application
+- Make the macOS script executable with the command:\
+`chmod +x build_IPTV_Player_macOS.sh`
+- Run [./build_IPTV_Player_macOS.sh](build_IPTV_Player_macOS.sh).
+- The generated application is written to `dist/IPTV Player.app`.
+- A versioned `dist/IPTV Player Vx.x.x.dmg` release package is also created.
+
+### 4. Install the application
+- Open the generated `.dmg` file.
+- Drag `IPTV Player.app` onto the `Applications` shortcut.
+- The build script removes PyInstaller's duplicate executable folder after the
+  `.app` bundle has been created. The `dist` folder contains the application for
+  local testing and the `.dmg` file for distribution.
+- On first launch, macOS may require Control-clicking the application and choosing
+  **Open** because the application is not code-signed.
 
 </details>

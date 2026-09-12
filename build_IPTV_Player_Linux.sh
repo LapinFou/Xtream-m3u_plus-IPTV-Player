@@ -2,14 +2,40 @@
 
 set -e
 
-# Check if PyInstaller is installed
-if ! command -v pyinstaller &> /dev/null; then
-  echo "PyInstaller not found. Please install it with 'pip install pyinstaller'"
+# Use the same Python interpreter for dependency checks and the build.
+if command -v python3 &> /dev/null; then
+  PYTHON_BIN=python3
+elif command -v python &> /dev/null; then
+  PYTHON_BIN=python
+else
+  echo "Python was not found. Install Python 3 and try again."
   exit 1
 fi
 
+# Check if PyInstaller is installed for the selected Python interpreter.
+if ! "$PYTHON_BIN" -m PyInstaller --version &> /dev/null; then
+  echo "PyInstaller not found. Please install it with '$PYTHON_BIN -m pip install pyinstaller'"
+  exit 1
+fi
+
+# Every dependency must belong to the interpreter used for packaging.
+if ! "$PYTHON_BIN" -c "import PyQt5, requests, lxml, dateutil, vlc" &> /dev/null; then
+  echo "Installing missing application dependencies..."
+  if ! "$PYTHON_BIN" -m pip install -r requirements.txt; then
+    echo "ERROR: Application dependencies could not be installed."
+    exit 1
+  fi
+fi
+
+# Confirm all modules can be collected before deleting previous builds.
+if ! "$PYTHON_BIN" -c "import PyQt5, requests, lxml, dateutil, vlc" &> /dev/null; then
+  echo "ERROR: Required Python modules are still unavailable. Build cancelled."
+  exit 1
+fi
+
+echo "Application dependencies are available."
+
 # Set variables
-PYINSTALLER=pyinstaller
 MAIN_SCRIPT="IPTV M3U_Plus PLAYER by MY-1.py"
 BUILD_PATH="build"
 DIST_PATH="dist"
@@ -25,14 +51,15 @@ if [ -d "$DIST_PATH" ]; then
   rm -rf "$DIST_PATH"
 fi
 
-# Run PyInstaller build
-$PYINSTALLER \
+# Run PyInstaller and explicitly collect the lazily imported VLC binding.
+"$PYTHON_BIN" -m PyInstaller \
   --clean \
   --onefile \
   --noconsole \
   --noconfirm \
-  --icon "Images/TV_icon.ico" \
-  --name "IPTV_Player" \
+  --hidden-import vlc \
+  --icon "Images/TV_icon.png" \
+  --name "IPTV Player" \
   --distpath "$DIST_PATH" \
   --workpath "$BUILD_PATH" \
   --add-data "Images/TV_icon.ico:Images" \
@@ -65,4 +92,4 @@ $PYINSTALLER \
   "$MAIN_SCRIPT"
 
 echo
-echo -e "\u2714 Build completed. The executable is in the folder $DIST_PATH."
+echo "Build completed: $DIST_PATH/IPTV Player"

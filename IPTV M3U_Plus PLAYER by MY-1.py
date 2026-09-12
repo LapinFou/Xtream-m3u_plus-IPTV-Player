@@ -8,36 +8,554 @@ import configparser
 import re
 import json
 import html
+import queue
+import threading
+import uuid
+from multiprocessing.connection import Client, Listener
 from lxml import etree, html
 from datetime import datetime
 from dateutil import parser, tz
 import xml.etree.ElementTree as ET
-from PyQt5.QtGui import QIcon, QFont, QImage, QPixmap, QColor, QDesktopServices, QIntValidator, QPalette
+from PyQt5.QtGui import QIcon, QFont, QImage, QPixmap, QColor, QDesktopServices, QIntValidator, QPalette, QPainter
 from PyQt5.QtCore import (
     Qt, QTimer, QPropertyAnimation, QEasingCurve, QSize, QObject, pyqtSignal, 
-    QRunnable, pyqtSlot, QThreadPool, QModelIndex, QAbstractItemModel, QVariant, QUrl
+    QRunnable, pyqtSlot, QThreadPool, QModelIndex, QAbstractItemModel, QVariant,
+    QUrl, QByteArray, QLocale
 )
 from PyQt5 import QtWidgets
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QVBoxLayout, QLineEdit, QLabel, QPushButton,
     QListWidget, QWidget, QFileDialog, QCheckBox, QSizePolicy, QHBoxLayout,
     QDialog, QFormLayout, QDialogButtonBox, QTabWidget, QListWidgetItem,
-    QSpinBox, QMenu, QAction, QTextEdit, QGridLayout, QMessageBox, QListView,
-    QTreeWidget, QTreeWidgetItem, QTreeView, QAction, QMenu, QComboBox, QSplitter
+    QSpinBox, QDoubleSpinBox, QMenu, QAction, QActionGroup, QTextEdit, QGridLayout, QMessageBox, QListView,
+    QTreeWidget, QTreeWidgetItem, QTreeView, QAction, QMenu, QComboBox, QSplitter,
+    QGroupBox, QRadioButton, QButtonGroup, QToolButton
 )
 
 from AccountManager import AccountManager
 from CustomPyQtWidgets import LiveInfoBox, MovieInfoBox, SeriesInfoBox, EmbeddedPlayerWindow
+from SearchUtils import normalize_search_text, title_matches_search
 import Threadpools
-from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher
+from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher, AccountInfoWorker
 
-CURRENT_VERSION = "V2.00.00"
+CURRENT_VERSION = "V2.01.17"
+REMEMBER_CATEGORY_SORTING = "Remember per category"
+
+DEFAULT_INTERNAL_SEEK_STEP_SECONDS = 10
+DEFAULT_INTERNAL_VOLUME_STEP_PERCENT = 2
+DEFAULT_INTERNAL_SPEED_STEP = 0.25
+MEDIA_LANGUAGE_OPTIONS = (
+    ("Arabic", "ara"), ("Chinese", "zho"), ("Dutch", "nld"),
+    ("English", "eng"), ("French", "fra"), ("German", "deu"),
+    ("Hindi", "hin"), ("Italian", "ita"), ("Japanese", "jpn"),
+    ("Korean", "kor"), ("Polish", "pol"), ("Portuguese", "por"),
+    ("Romanian", "ron"), ("Russian", "rus"), ("Spanish", "spa"),
+    ("Turkish", "tur"),
+)
+
+# CURRENT_CONFIG_SCHEMA_VERSION describes the structure and meaning of userdata.ini.
+# Increment the schema only when a release changes persisted data and add a matching,
+# ordered migration in updateUserDataFile(). It is intentionally independent from
+# CURRENT_VERSION because most application releases do not change persisted data.
+CURRENT_CONFIG_SCHEMA_VERSION = 1
 
 is_windows  = sys.platform.startswith('win')
 is_mac      = sys.platform.startswith('darwin')
 is_linux    = sys.platform.startswith('linux')
 
 GITHUB_REPO = "Youri666/Xtream-m3u_plus-IPTV-Player"
+
+
+def writable_data_directory():
+    """Return the directory used for configuration and disposable user data."""
+    if is_mac:
+        # A signed or Finder-launched .app must not rely on its bundle directory
+        # being writable. Application Support is the standard persistent location.
+        return path.join(path.expanduser("~"), "Library", "Application Support", "IPTV Player")
+    return path.abspath(".")
+
+
+def macos_bundle_executable(bundle_path):
+    """Resolve the executable declared by a macOS .app bundle."""
+    import plistlib
+
+    info_path = path.join(bundle_path, "Contents", "Info.plist")
+    with open(info_path, "rb") as info_file:
+        executable_name = plistlib.load(info_file).get("CFBundleExecutable", "")
+    if not executable_name:
+        raise OSError(f"The application bundle has no CFBundleExecutable: {bundle_path}")
+    executable_path = path.join(bundle_path, "Contents", "MacOS", executable_name)
+    if not path.isfile(executable_path) or not os.access(executable_path, os.X_OK):
+        raise OSError(f"The application bundle executable is unavailable: {executable_path}")
+    return executable_path
+
+
+class KeyboardNavigableListWidget(QListWidget):
+    """Give catalog lists explicit keyboard activation and column switching."""
+
+    keyboardSelected = pyqtSignal(QListWidgetItem)
+    keyboardActivated = pyqtSignal(QListWidgetItem)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._tab_target = None
+
+    def setTabTarget(self, target):
+        self._tab_target = target
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            current_item = self.currentItem()
+            if current_item is not None:
+                self.keyboardActivated.emit(current_item)
+            event.accept()
+            return
+
+        if event.key() in (Qt.Key_Tab, Qt.Key_Backtab) and self._tab_target is not None:
+            if self._tab_target.currentItem() is None and self._tab_target.count():
+                self._tab_target.setCurrentRow(0)
+                self._tab_target.keyboardSelected.emit(self._tab_target.currentItem())
+            self._tab_target.setFocus(Qt.TabFocusReason)
+            event.accept()
+            return
+
+        navigation_keys = (
+            Qt.Key_Up, Qt.Key_Down, Qt.Key_Home, Qt.Key_End,
+            Qt.Key_PageUp, Qt.Key_PageDown
+        )
+        if event.key() in navigation_keys:
+            previous_item = self.currentItem()
+            super().keyPressEvent(event)
+            current_item = self.currentItem()
+            if current_item is not None and current_item is not previous_item:
+                self.keyboardSelected.emit(current_item)
+            return
+
+        super().keyPressEvent(event)
+
+
+def private_url_log_reference(url):
+    """Identify a stream in logs without exposing its host or credentials."""
+    try:
+        from urllib.parse import urlparse
+        final_component = path.basename(urlparse(str(url)).path)
+        return f"<private URL ending in {final_component or 'unknown'}>"
+    except Exception:
+        return "<private URL>"
+
+
+class EmbeddedPlayerCommandBridge(QObject):
+    """Deliver commands received off the GUI thread to the player safely."""
+
+    command_received = pyqtSignal(dict)
+    connection_closed = pyqtSignal()
+
+
+def is_system_dark(app):
+    """Return whether the operating-system application theme is dark."""
+    if is_windows:
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                return value == 0
+        except OSError:
+            return False
+    try:
+        background = app.palette().color(QPalette.Window)
+        # Use perceived luminance rather than assuming a platform-specific palette.
+        luminance = (
+            0.299 * background.red()
+            + 0.587 * background.green()
+            + 0.114 * background.blue()
+        )
+        return luminance < 128
+    except Exception:
+        return False
+
+
+def apply_application_theme(app, theme_name):
+    """Apply one shared palette to the main application and isolated player."""
+    selected_theme = theme_name if theme_name in ("System", "Light", "Dark") else "System"
+    dark = selected_theme == "Dark" or (
+        selected_theme == "System" and is_system_dark(app)
+    )
+    if dark:
+        palette = QPalette()
+        palette.setColor(QPalette.Window,          QColor(45, 45, 48))
+        palette.setColor(QPalette.WindowText,      Qt.white)
+        palette.setColor(QPalette.Base,            QColor(30, 30, 30))
+        palette.setColor(QPalette.AlternateBase,   QColor(45, 45, 48))
+        palette.setColor(QPalette.ToolTipBase,     QColor(45, 45, 48))
+        palette.setColor(QPalette.ToolTipText,     Qt.white)
+        palette.setColor(QPalette.Text,            Qt.white)
+        palette.setColor(QPalette.Button,          QColor(45, 45, 48))
+        palette.setColor(QPalette.ButtonText,      Qt.white)
+        palette.setColor(QPalette.BrightText,      Qt.red)
+        palette.setColor(QPalette.Link,            QColor(91, 141, 239))
+        palette.setColor(QPalette.Highlight,       QColor(91, 141, 239))
+        palette.setColor(QPalette.HighlightedText, Qt.black)
+        palette.setColor(QPalette.Disabled, QPalette.Text,       QColor(127, 127, 127))
+        palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(127, 127, 127))
+        app.setPalette(palette)
+    else:
+        app.setPalette(app.style().standardPalette())
+    return dark
+
+
+def apply_windows_title_bar_theme(widget, dark):
+    """Synchronize a native Windows title bar with the Qt application theme."""
+    if not is_windows:
+        return
+    try:
+        import ctypes
+        enabled = ctypes.c_int(1 if dark else 0)
+        hwnd = int(widget.winId())
+        # Attribute 20 is current; 19 supports older Windows 10 builds.
+        for attribute in (20, 19):
+            result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(enabled), ctypes.sizeof(enabled)
+            )
+            if result == 0:
+                break
+
+        # Windows can otherwise choose a slightly different caption tint for
+        # dialogs and main windows. Attributes 35 and 36 make every native title
+        # bar use the same Qt palette colors on supported Windows 11 versions.
+        caption = widget.palette().color(QPalette.Window)
+        caption_color = ctypes.c_uint(
+            caption.red() | (caption.green() << 8) | (caption.blue() << 16)
+        )
+        text = widget.palette().color(QPalette.WindowText)
+        text_color = ctypes.c_uint(
+            text.red() | (text.green() << 8) | (text.blue() << 16)
+        )
+        for attribute, color in ((35, caption_color), (36, text_color)):
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attribute, ctypes.byref(color), ctypes.sizeof(color)
+            )
+    except Exception:
+        pass
+
+
+def application_palette_is_dark(app):
+    """Return whether the palette currently applied to Qt is dark."""
+    background = app.palette().color(QPalette.Window)
+    luminance = (
+        0.299 * background.red()
+        + 0.587 * background.green()
+        + 0.114 * background.blue()
+    )
+    return luminance < 128
+
+
+class NetworkSettingsDialog(QDialog):
+    """Edit advanced provider and network preferences in a compact dialog."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent_app = parent
+        self.setWindowTitle("Advanced settings")
+        self.setModal(True)
+
+        main_layout = QVBoxLayout(self)
+
+        general_group = QGroupBox("General network")
+        general_form = QFormLayout(general_group)
+
+        self.user_agent_box = QComboBox()
+        self.user_agent_box.addItems(parent.user_agents)
+        self.user_agent_box.setCurrentText(parent.current_user_agent)
+        # A full User-Agent can be very long. Give the combo box a practical size
+        # hint so adjustSize() fits the form without making the dialog excessively wide.
+        self.user_agent_box.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.user_agent_box.setMinimumContentsLength(40)
+        self.user_agent_box.setToolTip("User-Agent sent with IPTV provider requests")
+
+        self.connection_timeout_spin = self._create_seconds_spinbox(
+            Threadpools.CONNECTION_TIMEOUT,
+            "Maximum time allowed to establish a connection"
+        )
+        self.read_timeout_spin = self._create_seconds_spinbox(
+            Threadpools.READ_TIMEOUT,
+            "Maximum time allowed while waiting for regular response data"
+        )
+
+        general_form.addRow("User-Agent:", self.user_agent_box)
+        general_form.addRow("Connection timeout:", self.connection_timeout_spin)
+        general_form.addRow("Read timeout:", self.read_timeout_spin)
+
+        self.account_refresh_checkbox = QCheckBox("Enable automatic Info refresh")
+        self.account_refresh_checkbox.setChecked(parent.account_info_auto_refresh_enabled)
+        self.account_refresh_checkbox.setToolTip(
+            "Refresh account information periodically while the Info tab is visible"
+        )
+        self.account_refresh_spin = self._create_seconds_spinbox(
+            parent.account_info_refresh_interval,
+            "Automatic account information refresh interval while the Info tab is visible"
+        )
+        self.account_refresh_spin.setRange(10, 3600)
+        self.account_refresh_checkbox.toggled.connect(
+            self.account_refresh_spin.setEnabled
+        )
+        self.account_refresh_spin.setEnabled(
+            self.account_refresh_checkbox.isChecked()
+        )
+        general_form.addRow(self.account_refresh_checkbox)
+        general_form.addRow("Info auto-refresh interval:", self.account_refresh_spin)
+
+        cache_group = QGroupBox("Provider catalog cache")
+        cache_form = QFormLayout(cache_group)
+        self.catalog_cache_checkbox = QCheckBox("Use cached provider catalogs")
+        self.catalog_cache_checkbox.setChecked(parent.catalog_cache_enabled)
+        self.catalog_cache_checkbox.setToolTip(
+            "Reuse LIVE, Movies, and Series data until the cache expires"
+        )
+        self.catalog_cache_hours_spin = QSpinBox()
+        self.catalog_cache_hours_spin.setRange(1, 720)
+        self.catalog_cache_hours_spin.setSuffix(" h")
+        self.catalog_cache_hours_spin.setValue(parent.catalog_cache_max_age_hours)
+        self.catalog_cache_hours_spin.setToolTip(
+            "Fetch fresh provider catalogs on the next account load after this age"
+        )
+        self.catalog_cache_checkbox.toggled.connect(
+            self.catalog_cache_hours_spin.setEnabled
+        )
+        self.catalog_cache_hours_spin.setEnabled(
+            self.catalog_cache_checkbox.isChecked()
+        )
+        self.refresh_catalog_button = QPushButton("Refresh provider catalog now")
+        self.refresh_catalog_button.clicked.connect(self.refresh_catalog_now)
+        cache_form.addRow(self.catalog_cache_checkbox)
+        cache_form.addRow("Refresh after:", self.catalog_cache_hours_spin)
+        cache_form.addRow(self.refresh_catalog_button)
+
+        live_group = QGroupBox("LIVE stream status")
+        live_layout = QVBoxLayout(live_group)
+        self.live_status_checkbox = QCheckBox("Enable LIVE stream status checks")
+        self.live_status_checkbox.setToolTip(
+            "Probe the selected LIVE channel and display its green/red status indicator"
+        )
+        self.live_status_checkbox.setChecked(parent.stream_status_enabled)
+        live_layout.addWidget(self.live_status_checkbox)
+
+        # Put the dependent controls in their own widget so disabling status checks
+        # also grays their labels, while the enabling checkbox remains clickable.
+        self.live_options_widget = QWidget()
+        live_form = QFormLayout(self.live_options_widget)
+        live_form.setContentsMargins(0, 0, 0, 0)
+        self.live_timeout_spin = self._create_seconds_spinbox(
+            Threadpools.LIVE_STATUS_TIMEOUT,
+            "Maximum wait for each LIVE status attempt"
+        )
+        self.live_retries_spin = QSpinBox()
+        self.live_retries_spin.setRange(0, Threadpools.MAX_LIVE_STATUS_RETRIES)
+        self.live_retries_spin.setValue(Threadpools.LIVE_STATUS_RETRIES)
+        self.live_retries_spin.setToolTip(
+            "Number of additional attempts after the initial LIVE status request"
+        )
+        live_form.addRow("Timeout per attempt:", self.live_timeout_spin)
+        live_form.addRow("Additional retries:", self.live_retries_spin)
+        live_layout.addWidget(self.live_options_widget)
+
+        self.live_status_checkbox.toggled.connect(self.live_options_widget.setEnabled)
+        self.live_options_widget.setEnabled(self.live_status_checkbox.isChecked())
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.Save
+            | QDialogButtonBox.Cancel
+            | QDialogButtonBox.RestoreDefaults
+        )
+        self.button_box.accepted.connect(self.save_settings)
+        self.button_box.rejected.connect(self.reject)
+        self.button_box.button(QDialogButtonBox.RestoreDefaults).clicked.connect(
+            self.restore_defaults
+        )
+
+        main_layout.addWidget(general_group)
+        main_layout.addWidget(cache_group)
+        main_layout.addWidget(live_group)
+        main_layout.addWidget(self.button_box)
+
+        # Compute the initial dimensions only after every control has been added.
+        # QDialog remains freely resizable because no fixed size is imposed.
+        main_layout.activate()
+        self.adjustSize()
+
+    @staticmethod
+    def _create_seconds_spinbox(value, tooltip):
+        """Create a consistently bounded timeout editor."""
+        spinbox = QSpinBox()
+        spinbox.setRange(1, 999)
+        spinbox.setSuffix(" s")
+        spinbox.setValue(value)
+        spinbox.setToolTip(tooltip)
+        return spinbox
+
+    def restore_defaults(self):
+        """Restore the documented defaults without closing or saving the dialog."""
+        self.user_agent_box.setCurrentText(Threadpools.DEFAULT_USER_AGENT_HEADER)
+        self.connection_timeout_spin.setValue(Threadpools.DEFAULT_CONNECTION_TIMEOUT)
+        self.read_timeout_spin.setValue(Threadpools.DEFAULT_READ_TIMEOUT)
+        self.live_status_checkbox.setChecked(True)
+        self.live_timeout_spin.setValue(Threadpools.DEFAULT_LIVE_STATUS_TIMEOUT)
+        self.live_retries_spin.setValue(Threadpools.DEFAULT_LIVE_STATUS_RETRIES)
+        self.account_refresh_spin.setValue(
+            Threadpools.DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL
+        )
+        self.account_refresh_checkbox.setChecked(True)
+        self.catalog_cache_checkbox.setChecked(True)
+        self.catalog_cache_hours_spin.setValue(
+            Threadpools.DEFAULT_CATALOG_CACHE_MAX_AGE_HOURS
+        )
+
+    def save_settings(self, force_catalog_refresh=False):
+        """Apply the complete dialog state as one coherent configuration update."""
+        self.parent_app.applyNetworkSettings(
+            self.user_agent_box.currentText(),
+            self.connection_timeout_spin.value(),
+            self.read_timeout_spin.value(),
+            self.live_timeout_spin.value(),
+            self.live_retries_spin.value(),
+            self.live_status_checkbox.isChecked(),
+            self.account_refresh_spin.value(),
+            self.account_refresh_checkbox.isChecked(),
+            self.catalog_cache_checkbox.isChecked(),
+            self.catalog_cache_hours_spin.value()
+        )
+        if force_catalog_refresh:
+            self.parent_app.refreshProviderCatalog()
+        self.accept()
+
+    def refresh_catalog_now(self):
+        """Save current settings and explicitly bypass the catalog cache once."""
+        self.save_settings(force_catalog_refresh=True)
+
+
+class CategoryVisibilityDialog(QDialog):
+    """Choose which provider categories remain visible for one content type."""
+
+    def __init__(self, parent, stream_type, categories, hidden_category_ids):
+        super().__init__(parent)
+        self.setWindowTitle(f"Select {stream_type} categories")
+        self.setModal(True)
+        self.resize(520, 620)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Checked categories are displayed. New provider categories are "
+            "automatically checked."
+        ))
+
+        self.category_list = QListWidget()
+        for category in sorted(
+            categories,
+            key=lambda entry: entry.get('category_name', '').casefold()
+        ):
+            category_id = str(category.get('category_id', ''))
+            item = QListWidgetItem(category.get('category_name', ''))
+            item.setData(Qt.UserRole, category_id)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.Unchecked if category_id in hidden_category_ids else Qt.Checked
+            )
+            self.category_list.addItem(item)
+        layout.addWidget(self.category_list)
+
+        selection_buttons = QHBoxLayout()
+        select_all_button = QPushButton("Select all")
+        deselect_all_button = QPushButton("Deselect all")
+        select_all_button.clicked.connect(lambda: self.set_all_checked(True))
+        deselect_all_button.clicked.connect(lambda: self.set_all_checked(False))
+        selection_buttons.addWidget(select_all_button)
+        selection_buttons.addWidget(deselect_all_button)
+        selection_buttons.addStretch()
+        layout.addLayout(selection_buttons)
+
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def set_all_checked(self, checked):
+        """Apply one check state to every provider category in the dialog."""
+        check_state = Qt.Checked if checked else Qt.Unchecked
+        for row in range(self.category_list.count()):
+            self.category_list.item(row).setCheckState(check_state)
+
+    def hidden_category_ids(self):
+        """Return only unchecked ids so future categories stay visible by default."""
+        return {
+            self.category_list.item(row).data(Qt.UserRole)
+            for row in range(self.category_list.count())
+            if self.category_list.item(row).checkState() != Qt.Checked
+        }
+
+
+class InternalPlayerSettingsDialog(QDialog):
+    """Edit keyboard, mouse, and transport steps for the internal player."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Internal player settings")
+        layout = QFormLayout(self)
+
+        self.seek_step = QSpinBox()
+        self.seek_step.setRange(1, 300)
+        self.seek_step.setSuffix(" seconds")
+        self.seek_step.setValue(parent.internal_seek_step_seconds)
+        self.seek_step.setToolTip("Amount used by seek buttons and Left/Right arrows")
+
+        self.volume_step = QSpinBox()
+        self.volume_step.setRange(1, 25)
+        self.volume_step.setSuffix(" %")
+        self.volume_step.setValue(parent.internal_volume_step_percent)
+        self.volume_step.setToolTip("Amount used by Up/Down arrows and the mouse wheel")
+
+        self.speed_step = QDoubleSpinBox()
+        self.speed_step.setRange(0.05, 1.00)
+        self.speed_step.setSingleStep(0.05)
+        self.speed_step.setDecimals(2)
+        self.speed_step.setSuffix("×")
+        # Keep the decimal separator consistent with the English-only interface
+        # and with the speed value displayed by the internal player.
+        self.speed_step.setLocale(QLocale.c())
+        self.speed_step.setValue(parent.internal_speed_step)
+        self.speed_step.setToolTip("Amount used by the slower/faster buttons and +/- keys")
+
+        self.audio_language = QComboBox()
+        self.audio_language.addItem("VLC default", "")
+        for language_name, language_code in MEDIA_LANGUAGE_OPTIONS:
+            self.audio_language.addItem(language_name, language_code)
+        audio_index = self.audio_language.findData(parent.internal_audio_language)
+        self.audio_language.setCurrentIndex(max(0, audio_index))
+
+        self.subtitle_language = QComboBox()
+        self.subtitle_language.addItem("VLC default", "")
+        self.subtitle_language.addItem("Disabled", "disabled")
+        for language_name, language_code in MEDIA_LANGUAGE_OPTIONS:
+            self.subtitle_language.addItem(language_name, language_code)
+        subtitle_index = self.subtitle_language.findData(parent.internal_subtitle_language)
+        self.subtitle_language.setCurrentIndex(max(0, subtitle_index))
+
+        layout.addRow("Seek step:", self.seek_step)
+        layout.addRow("Volume step:", self.volume_step)
+        layout.addRow("Playback speed step:", self.speed_step)
+        layout.addRow("Preferred audio:", self.audio_language)
+        layout.addRow("Preferred subtitles:", self.subtitle_language)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
 
 class IPTVPlayerApp(QMainWindow):
     def __init__(self):
@@ -63,9 +581,26 @@ class IPTVPlayerApp(QMainWindow):
         ]
         self.current_user_agent = ""
 
-        self.user_data_file = "userdata.ini"
-        self.favorites_file = "favorites.json"
-        self.cache_file     = "all_cached_data.json"
+        self.data_directory = writable_data_directory()
+        os.makedirs(self.data_directory, exist_ok=True)
+        self.user_data_file = path.join(self.data_directory, "userdata.ini")
+        self.favorites_file = path.join(self.data_directory, "favorites.json")
+        self.cache_file = path.join(self.data_directory, "all_cached_data.json")
+
+        # The internal VLC UI runs in a second process. Commands are queued so
+        # sending a large visible playlist can never block the main Qt event loop.
+        self._embedded_player_process = None
+        self._embedded_player_listener = None
+        self._embedded_player_command_queue = None
+        self._embedded_player_sender_thread = None
+
+        # These defaults are replaced by persisted values during startup and are
+        # sent to the isolated VLC process whenever it is started or reconfigured.
+        self.internal_seek_step_seconds = DEFAULT_INTERNAL_SEEK_STEP_SECONDS
+        self.internal_volume_step_percent = DEFAULT_INTERNAL_VOLUME_STEP_PERCENT
+        self.internal_speed_step = DEFAULT_INTERNAL_SPEED_STEP
+        self.internal_audio_language = ""
+        self.internal_subtitle_language = ""
         # Default values for URL formats
         self.default_url_formats = {
             'live': "{server}/live/{username}/{password}/{stream_id}.{container_extension}",
@@ -75,6 +610,7 @@ class IPTVPlayerApp(QMainWindow):
 
         # Update the .ini file if needed to maintain backward compatibility.
         self.updateUserDataFile()
+        self._migrateLegacyPlayerVolume()
 
         self.path_to_window_icon            = path.abspath(path.join(path.dirname(__file__), 'Images/TV_icon.ico'))
         self.path_to_no_img                 = path.abspath(path.join(path.dirname(__file__), 'Images/no_image.jpg'))
@@ -155,16 +691,60 @@ class IPTVPlayerApp(QMainWindow):
             'Episodes': []
         }
 
-        # Whether to request the VODs or not
-        self.vods_enabled = True
+        # Cache the filtered and ordered entry lists used by category views. The
+        # provider data is already cached, but preparing "All" again can still scan
+        # and sort tens of thousands of Movies every time the user returns to it.
+        self.category_view_cache = {
+            'LIVE': {},
+            'Movies': {},
+            'Series': {}
+        }
+        # QListWidgetItem creation dominates category switching for very large
+        # catalogs. Detached items can safely be kept and reattached when the same
+        # view is opened again, making repeated switches effectively immediate.
+        self.category_item_cache = {
+            'LIVE': {},
+            'Movies': {},
+            'Series': {}
+        }
+        self.active_category_view_key = {
+            'LIVE': None,
+            'Movies': None,
+            'Series': None
+        }
+
+        # Each content type can be hidden and omitted from provider requests.
+        self.content_enabled = {
+            'LIVE': True,
+            'Movies': True,
+            'Series': True
+        }
 
         #Create search bar dicts
         self.category_search_bars   = {}
         self.streaming_search_bars  = {}
+        self.category_search_widgets = {}
+        self.streaming_search_widgets = {}
 
-        #Create sorting all lists setting variable. Set sorting to A-Z by default.
-        self.sorting_enabled    = True
+        # Preserve the provider order until the user explicitly selects sorting.
+        self.sorting_enabled    = False
         self.sorting_order      = 0
+        self.remember_category_sorting = False
+        self.category_sort_fallback = 'disabled'
+        self.category_sort_preferences = {
+            'LIVE': {},
+            'Movies': {},
+            'Series': {}
+        }
+        self.category_list_sort_preferences = {}
+
+        # Store exclusions rather than visible ids so categories introduced by the
+        # provider after an application update remain visible without user action.
+        self.hidden_category_ids = {
+            'LIVE': set(),
+            'Movies': set(),
+            'Series': set()
+        }
 
         #Credentials
         self.server            = ""
@@ -189,6 +769,23 @@ class IPTVPlayerApp(QMainWindow):
         #the probe is producing false offline reports.
         self.stream_status_enabled = True
 
+        # Account metadata has its own lightweight worker and timer. It must never
+        # trigger a playlist, category, stream, or EPG reload.
+        self.account_info_refresh_interval = (
+            Threadpools.DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL
+        )
+        self.account_info_auto_refresh_enabled = True
+        self.catalog_cache_enabled = True
+        self.catalog_cache_max_age_hours = (
+            Threadpools.DEFAULT_CATALOG_CACHE_MAX_AGE_HOURS
+        )
+        self.account_info_refresh_in_progress = False
+        self.account_info_worker = None
+        self.account_info_threadpool = QThreadPool()
+        self.account_info_threadpool.setMaxThreadCount(1)
+        self.account_info_timer = QTimer(self)
+        self.account_info_timer.timeout.connect(self.refreshAccountInfo)
+
         self.initIcons()
 
         self.initTabWidget()
@@ -211,13 +808,13 @@ class IPTVPlayerApp(QMainWindow):
         self.loadDataAtStartup()
 
         #Create live tv tab splitter
-        live_splitter = QSplitter(Qt.Horizontal)
+        self.live_splitter = QSplitter(Qt.Horizontal)
 
         # Column 0 widget (category)
         live_category_container = QWidget()
         live_category_layout = QVBoxLayout(live_category_container)
         live_category_layout.setContentsMargins(0, 0, 0, 0)
-        live_category_layout.addWidget(self.category_search_bars["LIVE"])
+        live_category_layout.addWidget(self.category_search_widgets["LIVE"])
         live_category_layout.addWidget(self.category_list_live)
 
         # Set width limits
@@ -227,7 +824,7 @@ class IPTVPlayerApp(QMainWindow):
         live_streaming_container = QWidget()
         live_streaming_layout = QVBoxLayout(live_streaming_container)
         live_streaming_layout.setContentsMargins(0, 0, 0, 0)
-        live_streaming_layout.addWidget(self.streaming_search_bars["LIVE"])
+        live_streaming_layout.addWidget(self.streaming_search_widgets["LIVE"])
         live_streaming_layout.addWidget(self.streaming_list_live)
 
         # Set width limits
@@ -243,29 +840,29 @@ class IPTVPlayerApp(QMainWindow):
         live_info_box_container.setMinimumWidth(300)
 
         # Add widgets to splitter
-        live_splitter.addWidget(live_category_container)
-        live_splitter.addWidget(live_streaming_container)
-        live_splitter.addWidget(live_info_box_container)
+        self.live_splitter.addWidget(live_category_container)
+        self.live_splitter.addWidget(live_streaming_container)
+        self.live_splitter.addWidget(live_info_box_container)
 
         # Stretch ratios (initial splitter sizes)
-        live_splitter.setSizes([200, 200, 300])  # Initial widths
+        self.live_splitter.setSizes([200, 200, 300])  # Initial widths
 
-        live_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
-        live_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
-        live_splitter.setCollapsible(2, False)  # prevent collapsing column 2
+        self.live_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
+        self.live_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
+        self.live_splitter.setCollapsible(2, False)  # prevent collapsing column 2
 
         # Add splitter to live tab layout
-        self.live_tab_layout.addWidget(live_splitter)
+        self.live_tab_layout.addWidget(self.live_splitter)
 
 
         #Create movies tab splitter
-        movies_splitter = QSplitter(Qt.Horizontal)
+        self.movies_splitter = QSplitter(Qt.Horizontal)
 
         # Column 0 widget (category)
         movies_category_container = QWidget()
         movies_category_layout = QVBoxLayout(movies_category_container)
         movies_category_layout.setContentsMargins(0, 0, 0, 0)
-        movies_category_layout.addWidget(self.category_search_bars["Movies"])
+        movies_category_layout.addWidget(self.category_search_widgets["Movies"])
         movies_category_layout.addWidget(self.category_list_movies)
 
         # Set width limits
@@ -275,7 +872,7 @@ class IPTVPlayerApp(QMainWindow):
         movies_streaming_container = QWidget()
         movies_streaming_layout = QVBoxLayout(movies_streaming_container)
         movies_streaming_layout.setContentsMargins(0, 0, 0, 0)
-        movies_streaming_layout.addWidget(self.streaming_search_bars["Movies"])
+        movies_streaming_layout.addWidget(self.streaming_search_widgets["Movies"])
         movies_streaming_layout.addWidget(self.streaming_list_movies)
 
         # Set width limits
@@ -291,29 +888,29 @@ class IPTVPlayerApp(QMainWindow):
         movies_info_box_container.setMinimumWidth(350)
 
         # Add widgets to splitter
-        movies_splitter.addWidget(movies_category_container)
-        movies_splitter.addWidget(movies_streaming_container)
-        movies_splitter.addWidget(movies_info_box_container)
+        self.movies_splitter.addWidget(movies_category_container)
+        self.movies_splitter.addWidget(movies_streaming_container)
+        self.movies_splitter.addWidget(movies_info_box_container)
 
         # Stretch ratios (initial splitter sizes)
-        movies_splitter.setSizes([200, 200, 300])  # Initial widths
+        self.movies_splitter.setSizes([200, 200, 300])  # Initial widths
 
-        movies_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
-        movies_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
-        movies_splitter.setCollapsible(2, False)  # prevent collapsing column 2
+        self.movies_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
+        self.movies_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
+        self.movies_splitter.setCollapsible(2, False)  # prevent collapsing column 2
 
         # Add splitter to movies tab layout
-        self.movies_tab_layout.addWidget(movies_splitter)
+        self.movies_tab_layout.addWidget(self.movies_splitter)
 
 
         #Create series tab splitter
-        series_splitter = QSplitter(Qt.Horizontal)
+        self.series_splitter = QSplitter(Qt.Horizontal)
 
         # Column 0 widget (category)
         series_category_container = QWidget()
         series_category_layout = QVBoxLayout(series_category_container)
         series_category_layout.setContentsMargins(0, 0, 0, 0)
-        series_category_layout.addWidget(self.category_search_bars["Series"])
+        series_category_layout.addWidget(self.category_search_widgets["Series"])
         series_category_layout.addWidget(self.category_list_series)
 
         # Set width limits
@@ -323,7 +920,7 @@ class IPTVPlayerApp(QMainWindow):
         series_streaming_container = QWidget()
         series_streaming_layout = QVBoxLayout(series_streaming_container)
         series_streaming_layout.setContentsMargins(0, 0, 0, 0)
-        series_streaming_layout.addWidget(self.streaming_search_bars["Series"])
+        series_streaming_layout.addWidget(self.streaming_search_widgets["Series"])
         series_streaming_layout.addWidget(self.streaming_list_series)
 
         # Set width limits
@@ -339,19 +936,19 @@ class IPTVPlayerApp(QMainWindow):
         series_info_box_container.setMinimumWidth(350)
 
         # Add widgets to splitter
-        series_splitter.addWidget(series_category_container)
-        series_splitter.addWidget(series_streaming_container)
-        series_splitter.addWidget(series_info_box_container)
+        self.series_splitter.addWidget(series_category_container)
+        self.series_splitter.addWidget(series_streaming_container)
+        self.series_splitter.addWidget(series_info_box_container)
 
         # Stretch ratios (initial splitter sizes)
-        series_splitter.setSizes([200, 200, 300])  # Initial widths
+        self.series_splitter.setSizes([200, 200, 300])  # Initial widths
 
-        series_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
-        series_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
-        series_splitter.setCollapsible(2, False)  # prevent collapsing column 2
+        self.series_splitter.setCollapsible(0, False)  # Prevent collapsing column 0
+        self.series_splitter.setCollapsible(1, False)  # Prevent collapsing column 1
+        self.series_splitter.setCollapsible(2, False)  # prevent collapsing column 2
 
         # Add splitter to series tab layout
-        self.series_tab_layout.addWidget(series_splitter)
+        self.series_tab_layout.addWidget(self.series_splitter)
         
         #Add iptv info text to info tab
         self.info_tab_layout.addWidget(self.iptv_info_text)
@@ -367,6 +964,103 @@ class IPTVPlayerApp(QMainWindow):
         main_layout.addWidget(self.tab_widget)
         main_layout.addWidget(self.progress_bar)
 
+        # Restore only after every splitter and tab exists. The saved geometry also
+        # carries the maximized state, while the splitter states preserve the three
+        # independently resized columns in each content tab.
+        self.restoreWindowLayout()
+
+    def _encoded_widget_state(self, state):
+        """Encode Qt's binary geometry/state payload for safe INI storage."""
+        return bytes(state.toBase64()).decode('ascii')
+
+    def _decoded_widget_state(self, encoded_state):
+        """Decode a persisted Qt state, returning an empty payload if invalid."""
+        try:
+            return QByteArray.fromBase64(encoded_state.encode('ascii'))
+        except (AttributeError, UnicodeEncodeError):
+            return QByteArray()
+
+    def restoreWindowLayout(self):
+        """Restore window geometry, active tab, and per-tab column widths."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError) as e:
+            print(f"Could not restore window layout: {e}")
+            return
+
+        if 'Window' not in config:
+            return
+
+        window_config = config['Window']
+        encoded_geometry = window_config.get('geometry', '')
+        if encoded_geometry:
+            self.restoreGeometry(self._decoded_widget_state(encoded_geometry))
+            self._ensure_window_is_visible()
+
+        splitters = {
+            'live_splitter': self.live_splitter,
+            'movies_splitter': self.movies_splitter,
+            'series_splitter': self.series_splitter
+        }
+        for setting_name, splitter in splitters.items():
+            encoded_state = window_config.get(setting_name, '')
+            if encoded_state:
+                splitter.restoreState(self._decoded_widget_state(encoded_state))
+
+        active_tab = window_config.get('active_tab', '')
+        for tab_index in range(self.tab_widget.count()):
+            if self.tab_widget.tabText(tab_index) == active_tab:
+                self.tab_widget.setCurrentIndex(tab_index)
+                break
+
+    def _ensure_window_is_visible(self):
+        """Move a restored window back on-screen after monitor layout changes."""
+        window_geometry = self.frameGeometry()
+        if any(
+            window_geometry.intersects(screen.availableGeometry())
+            for screen in QApplication.screens()
+        ):
+            return
+
+        primary_screen = QApplication.primaryScreen()
+        if primary_screen is None:
+            return
+
+        available = primary_screen.availableGeometry()
+        self.setWindowState(Qt.WindowNoState)
+        self.resize(min(1300, available.width()), min(900, available.height()))
+        centered_geometry = self.frameGeometry()
+        centered_geometry.moveCenter(available.center())
+        self.move(centered_geometry.topLeft())
+
+    def saveWindowLayout(self):
+        """Persist durable UI layout preferences in userdata.ini."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+
+        config['Window'] = {
+            'geometry': self._encoded_widget_state(self.saveGeometry()),
+            'live_splitter': self._encoded_widget_state(self.live_splitter.saveState()),
+            'movies_splitter': self._encoded_widget_state(self.movies_splitter.saveState()),
+            'series_splitter': self._encoded_widget_state(self.series_splitter.saveState()),
+            'active_tab': self.tab_widget.tabText(self.tab_widget.currentIndex())
+        }
+
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+        except OSError as e:
+            print(f"Could not save window layout: {e}")
+
+    def closeEvent(self, event):
+        self.saveWindowLayout()
+        self._stopEmbeddedPlayerProcess()
+        super().closeEvent(event)
+
     def updateUserDataFile(self):
         # Load the configuration file. A corrupted .ini must not crash the app —
         # fall back to a fresh config so the user can re-add accounts.
@@ -381,37 +1075,98 @@ class IPTVPlayerApp(QMainWindow):
                 pass
             return
 
-        # Check if 'Credentials' section exists
-        if 'Credentials' not in config:
-            return
+        if 'Credentials' in config:
+            for account_name, data in config['Credentials'].items():
+                parts = data.split('|')
 
-        for account_name, data in config['Credentials'].items():
-            parts = data.split('|')
+                # Required total length and which fields are the URL-format tail.
+                if data.startswith('manual|'):
+                    required_length = 7  # manual|server|user|pass|live_fmt|movie_fmt|series_fmt
+                elif data.startswith('m3u_plus|'):
+                    required_length = 5  # m3u_plus|url|live_fmt|movie_fmt|series_fmt
+                else:
+                    continue
 
-            # Required total length and which fields are the URL-format tail.
-            if data.startswith('manual|'):
-                required_length = 7  # manual|server|user|pass|live_fmt|movie_fmt|series_fmt+1 leading tag
-            elif data.startswith('m3u_plus|'):
-                required_length = 5  # m3u_plus|url|live_fmt|movie_fmt|series_fmt+1 leading tag
-            else:
-                continue
+                # Append default URL formats for whichever ones are missing at the tail.
+                if len(parts) < required_length:
+                    defaults = [self.default_url_formats['live'],
+                                self.default_url_formats['movie'],
+                                self.default_url_formats['series']]
+                    missing = required_length - len(parts)
+                    # Take the LAST `missing` defaults because missing formats are
+                    # always the trailing fields of the serialized account value.
+                    parts += defaults[-missing:]
+                    config['Credentials'][account_name] = "|".join(parts)
 
-            # Append default URL formats for whichever ones are missing at the tail.
-            if len(parts) < required_length:
-                defaults = [self.default_url_formats['live'],
-                            self.default_url_formats['movie'],
-                            self.default_url_formats['series']]
-                missing = required_length - len(parts)
-                # Take the LAST `missing` defaults (the tail of the list), not the first —
-                # the first defaults that exist in `parts` are for live/movie, missing ones are at the end.
-                parts += defaults[-missing:]
-                config['Credentials'][account_name] = "|".join(parts)
+        # Migration contract for future configuration changes:
+        #   1. Increment CURRENT_CONFIG_SCHEMA_VERSION.
+        #   2. Add an ordered `if stored_schema_version < N` block below.
+        #   3. Make the migration safe to run more than once and preserve user choices.
+        # The stored marker represents the latest completed migration. It is written
+        # only after all migration blocks have executed and the configuration is ready.
+        try:
+            stored_schema_version = config.getint(
+                'Application', 'config_schema_version', fallback=0
+            )
+        except (ValueError, configparser.Error):
+            stored_schema_version = 0
+
+        if stored_schema_version < 1:
+            # Schema 1 replaces the combined VOD switch with independent content
+            # switches. Reuse the legacy value for Movies and Series so migration
+            # never changes an existing user's provider traffic preference.
+            try:
+                legacy_vods_enabled = config.getboolean('VOD', 'enabled', fallback=True)
+            except (ValueError, configparser.Error):
+                legacy_vods_enabled = True
+
+            if 'Content' not in config:
+                config['Content'] = {}
+            content = config['Content']
+            if 'LIVE' not in content:
+                content['LIVE'] = 'True'
+            if 'Movies' not in content:
+                content['Movies'] = str(legacy_vods_enabled)
+            if 'Series' not in content:
+                content['Series'] = str(legacy_vods_enabled)
+
+        if 'Application' not in config:
+            config['Application'] = {}
+        # Early V2.01 test builds briefly stored the application version here. Remove
+        # that redundant key because CURRENT_VERSION already drives update checks.
+        config.remove_option('Application', 'last_run_version')
+        # Preserve a newer schema number if this build opens a configuration that
+        # was previously written by a future application version.
+        config['Application']['config_schema_version'] = str(
+            max(stored_schema_version, CURRENT_CONFIG_SCHEMA_VERSION)
+        )
 
         try:
             with open(self.user_data_file, 'w') as config_file:
                 config.write(config_file)
         except OSError as e:
             print(f"Could not persist user data file: {e}")
+
+    def _migrateLegacyPlayerVolume(self):
+        """Move the former standalone volume preference into userdata.ini."""
+        legacy_path = path.join(self.data_directory, ".embedded_player_volume")
+        if not path.isfile(legacy_path):
+            return
+
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+            if not config.has_option("InternalPlayer", "volume"):
+                with open(legacy_path, "r") as legacy_file:
+                    volume = max(0, min(100, int(legacy_file.read().strip())))
+                if not config.has_section("InternalPlayer"):
+                    config.add_section("InternalPlayer")
+                config.set("InternalPlayer", "volume", str(volume))
+                with open(self.user_data_file, "w") as config_file:
+                    config.write(config_file)
+            os.remove(legacy_path)
+        except (OSError, ValueError, configparser.Error, UnicodeDecodeError) as error:
+            print(f"Could not migrate the legacy player volume: {error}")
 
     def initIcons(self):
         #Set tab icon size to 24x24
@@ -437,98 +1192,477 @@ class IPTVPlayerApp(QMainWindow):
         self.clear_btn_icon = QIcon(self.path_to_clear_btn_icon)
         self.go_back_icon   = QIcon(self.path_to_go_back_icon)
 
+    def _tinted_icon(self, source_icon, color):
+        """Create a monochrome copy of an icon that contrasts with the theme."""
+        source = source_icon.pixmap(24, 24)
+        tinted = QPixmap(source.size())
+        tinted.fill(Qt.transparent)
+        painter = QPainter(tinted)
+        painter.drawPixmap(0, 0, source)
+        painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        painter.fillRect(tinted.rect(), color)
+        painter.end()
+        return QIcon(tinted)
+
+    def _category_icon(self, color):
+        """Draw a transparent category grid using the current theme contrast."""
+        # Some native Qt list icons have an opaque background. Tinting such an
+        # icon colors its complete rectangle, so draw this simple symbol directly.
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        for x in (4, 13):
+            for y in (4, 13):
+                painter.fillRect(x, y, 7, 7, color)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _refresh_theme_icons(self, dark):
+        """Refresh monochrome icons after the application palette changes."""
+        color = QColor("#f2f2f2" if dark else "#202020")
+        themed_paths = {
+            'home_icon': self.path_to_home_icon,
+            'live_icon': self.path_to_live_icon,
+            'movies_icon': self.path_to_movies_icon,
+            'series_icon': self.path_to_series_icon,
+            'favorites_icon': self.path_to_favorites_icon,
+            'info_icon': self.path_to_info_icon,
+            'settings_icon': self.path_to_settings_icon,
+            'account_manager_icon': self.path_to_account_icon,
+            'mediaplayer_icon': self.path_to_mediaplayer_icon,
+            'search_icon': self.path_to_search_icon,
+            'sorting_icon': self.path_to_sorting_icon,
+            'clear_btn_icon': self.path_to_clear_btn_icon,
+            'go_back_icon': self.path_to_go_back_icon,
+        }
+        for attribute, icon_path in themed_paths.items():
+            setattr(self, attribute, self._tinted_icon(QIcon(icon_path), color))
+
+        if hasattr(self, 'tab_widget'):
+            tab_icons = {
+                'LIVE': self.live_icon,
+                'Movies': self.movies_icon,
+                'Series': self.series_icon,
+                'Info': self.info_icon,
+                'Settings': self.settings_icon,
+            }
+            for index in range(self.tab_widget.count()):
+                icon = tab_icons.get(self.tab_widget.tabText(index))
+                if icon is not None:
+                    self.tab_widget.setTabIcon(index, icon)
+
+        for search_bar in (
+            list(getattr(self, 'category_search_bars', {}).values())
+            + list(getattr(self, 'streaming_search_bars', {}).values())
+        ):
+            if hasattr(search_bar, 'search_action'):
+                search_bar.search_action.setIcon(self.search_icon)
+            if hasattr(search_bar, 'sort_button'):
+                search_bar.sort_button.setIcon(self.sorting_icon)
+            if hasattr(search_bar, 'clear_button'):
+                search_bar.clear_button.setIcon(self.clear_btn_icon)
+            if hasattr(search_bar, 'category_visibility_button'):
+                search_bar.category_visibility_button.setIcon(
+                    self._category_icon(color)
+                )
+
+        if hasattr(self, 'address_book_button'):
+            self.address_book_button.setIcon(self.account_manager_icon)
+        if hasattr(self, 'choose_player_button'):
+            self.choose_player_button.setIcon(self.mediaplayer_icon)
+
+    def statusPixmap(self, icon_path, width=24):
+        """Load a colored status circle without its legacy opaque white corners."""
+        pixmap = QPixmap(icon_path)
+        pixmap.setMask(pixmap.createMaskFromColor(QColor(Qt.white), Qt.MaskInColor))
+        return pixmap.scaledToWidth(width, Qt.SmoothTransformation)
+
     def initTabWidget(self):
         #Create tab widget
         self.tab_widget = QTabWidget()
 
         #Create tabs
-        home_tab        = QWidget()
-        live_tab        = QWidget()
-        movies_tab      = QWidget()
-        series_tab      = QWidget()
-        favorites_tab   = QWidget()
-        info_tab        = QWidget()
-        settings_tab    = QWidget()
+        home_tab          = QWidget()
+        self.live_tab     = QWidget()
+        self.movies_tab   = QWidget()
+        self.series_tab   = QWidget()
+        favorites_tab     = QWidget()
+        self.info_tab     = QWidget()
+        settings_tab      = QWidget()
 
         #Create layouts for tabs
         self.home_tab_layout        = QVBoxLayout(home_tab)
-        self.live_tab_layout        = QVBoxLayout(live_tab)
-        self.movies_tab_layout      = QVBoxLayout(movies_tab)
-        self.series_tab_layout      = QVBoxLayout(series_tab)
+        self.live_tab_layout        = QVBoxLayout(self.live_tab)
+        self.movies_tab_layout      = QVBoxLayout(self.movies_tab)
+        self.series_tab_layout      = QVBoxLayout(self.series_tab)
         self.favorites_tab_layout   = QGridLayout(favorites_tab)
-        self.info_tab_layout        = QVBoxLayout(info_tab)
+        self.info_tab_layout        = QVBoxLayout(self.info_tab)
         self.settings_layout        = QGridLayout(settings_tab)
 
         #Add created tabs to tab widget with their names
         # self.tab_widget.addTab(home_tab,        self.home_icon,         "Home")
-        self.tab_widget.addTab(live_tab,        self.live_icon,         "LIVE")
-        self.tab_widget.addTab(movies_tab,      self.movies_icon,       "Movies")
-        self.tab_widget.addTab(series_tab,      self.series_icon,       "Series")
+        self.tab_widget.addTab(self.live_tab,   self.live_icon,         "LIVE")
+        self.tab_widget.addTab(self.movies_tab, self.movies_icon,       "Movies")
+        self.tab_widget.addTab(self.series_tab, self.series_icon,       "Series")
         # self.tab_widget.addTab(favorites_tab,   self.favorites_icon,    "Favorites")
-        self.tab_widget.addTab(info_tab,        self.info_icon,         "Info")
+        self.tab_widget.addTab(self.info_tab,   self.info_icon,         "Info")
         self.tab_widget.addTab(settings_tab,    self.settings_icon,     "Settings")
+        self.tab_widget.currentChanged.connect(self._onCurrentTabChanged)
 
     def initSearchBars(self):
         #Initialize search bars for category lists
         self.category_search_bars["LIVE"] = QLineEdit()
         self.category_search_bars["LIVE"].setPlaceholderText("Search Live TV Categories...")
-        self.configSearchBar(self.category_search_bars["LIVE"], 'category', 'LIVE', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
+        self.category_search_widgets["LIVE"] = self.configSearchBar(self.category_search_bars["LIVE"], 'category', 'LIVE', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
 
         self.category_search_bars["Movies"] = QLineEdit()
         self.category_search_bars["Movies"].setPlaceholderText("Search Movies Categories...")
-        self.configSearchBar(self.category_search_bars["Movies"], 'category', 'Movies', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
+        self.category_search_widgets["Movies"] = self.configSearchBar(self.category_search_bars["Movies"], 'category', 'Movies', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
 
         self.category_search_bars["Series"] = QLineEdit()
         self.category_search_bars["Series"].setPlaceholderText("Search Series Categories...")
-        self.configSearchBar(self.category_search_bars["Series"], 'category', 'Series', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
+        self.category_search_widgets["Series"] = self.configSearchBar(self.category_search_bars["Series"], 'category', 'Series', self.category_list_widgets, self.category_search_history_list, self.category_search_history_list_idx)
 
         #Initialize search bars for streaming content lists
         self.streaming_search_bars["LIVE"] = QLineEdit()
         self.streaming_search_bars["LIVE"].setPlaceholderText("Search Live TV Channels...")
-        self.configSearchBar(self.streaming_search_bars["LIVE"], 'streaming', 'LIVE', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
+        self.streaming_search_widgets["LIVE"] = self.configSearchBar(self.streaming_search_bars["LIVE"], 'streaming', 'LIVE', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
 
         self.streaming_search_bars["Movies"] = QLineEdit()
         self.streaming_search_bars["Movies"].setPlaceholderText("Search Movies...")
-        self.configSearchBar(self.streaming_search_bars["Movies"], 'streaming', 'Movies', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
+        self.streaming_search_widgets["Movies"] = self.configSearchBar(self.streaming_search_bars["Movies"], 'streaming', 'Movies', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
 
         self.streaming_search_bars["Series"] = QLineEdit()
         self.streaming_search_bars["Series"].setPlaceholderText("Search Series...")
-        self.configSearchBar(self.streaming_search_bars["Series"], 'streaming', 'Series', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
+        self.streaming_search_widgets["Series"] = self.configSearchBar(self.streaming_search_bars["Series"], 'streaming', 'Series', self.streaming_list_widgets, self.streaming_search_history_list, self.streaming_search_history_list_idx)
 
     def configSearchBar(self, search_bar, list_content_type, stream_type, list_widgets, search_history_list, search_history_list_idx):
         #Create sorting actions
         sort_a_z        = QAction("A-Z", self)
         sort_z_a        = QAction("Z-A", self)
         sort_disabled   = QAction("Sorting disabled", self)
+        for sorting_action in (sort_a_z, sort_z_a, sort_disabled):
+            sorting_action.setCheckable(True)
 
         #Add search icon
-        search_bar.addAction(self.search_icon, QLineEdit.LeadingPosition)
+        search_bar.search_action = search_bar.addAction(
+            self.search_icon, QLineEdit.LeadingPosition
+        )
+
+        # Use a real tool button for the menu. A QAction embedded in QLineEdit may
+        # consume the first click only to focus the editor on Windows, which makes
+        # the user click another column before the sorting menu becomes available.
+        sort_button = QToolButton()
+        sort_button.setIcon(self.sorting_icon)
+        sort_button.setToolTip("Set sorting order")
+        sort_button.setPopupMode(QToolButton.InstantPopup)
 
         #Create sorting action menu
-        sorting_menu = QMenu()
+        sorting_menu = QMenu(sort_button)
         sorting_menu.setTitle("Set sorting order:")
+        sorting_group = QActionGroup(sorting_menu)
+        sorting_group.setExclusive(True)
+        sorting_group.addAction(sort_a_z)
+        sorting_group.addAction(sort_z_a)
+        sorting_group.addAction(sort_disabled)
         sorting_menu.addActions([sort_a_z, sort_z_a, sort_disabled])
-
-        #Create sorting button
-        sort_action = QAction(self.sorting_icon, "sort", self)
-        sort_action.setMenu(sorting_menu)
-        search_bar.addAction(sort_action, QLineEdit.TrailingPosition)
+        sort_button.setMenu(sorting_menu)
 
         #Connect functions to sorting actions
-        sort_a_z.triggered.connect(lambda: self.sortList(search_bar, list_content_type, stream_type, list_widgets, True, 0))
-        sort_z_a.triggered.connect(lambda: self.sortList(search_bar, list_content_type, stream_type, list_widgets, True, 1))
-        sort_disabled.triggered.connect(lambda: self.sortList(search_bar, list_content_type, stream_type, list_widgets, False, 0))
+        sort_a_z.triggered.connect(
+            lambda: self.applySortingChoice(
+                search_bar, list_content_type, stream_type, list_widgets, True, 0
+            )
+        )
+        sort_z_a.triggered.connect(
+            lambda: self.applySortingChoice(
+                search_bar, list_content_type, stream_type, list_widgets, True, 1
+            )
+        )
+        sort_disabled.triggered.connect(
+            lambda: self.applySortingChoice(
+                search_bar, list_content_type, stream_type, list_widgets, False, 0
+            )
+        )
 
-        #Create clear search button
-        clear_action = QAction(self.clear_btn_icon, "clear", self)
-        search_bar.addAction(clear_action, QLineEdit.TrailingPosition)
+        # Keep clearing independent from editor focus for the same reason.
+        clear_button = QToolButton()
+        clear_button.setIcon(self.clear_btn_icon)
+        clear_button.setToolTip("Clear search")
 
         #Connect function to clear search action
-        clear_action.triggered.connect(lambda: self.clearSearch(search_bar, list_content_type, stream_type, list_widgets, search_history_list_idx))
+        clear_button.clicked.connect(lambda: self.clearSearch(search_bar, list_content_type, stream_type, list_widgets, search_history_list_idx))
+
+        # Store references on the editor for tests and future UI customization.
+        search_bar.sort_button = sort_button
+        search_bar.clear_button = clear_button
+        search_bar.sorting_menu = sorting_menu
+        search_bar.sorting_group = sorting_group
+        search_bar.sort_actions = {
+            'a_z': sort_a_z,
+            'z_a': sort_z_a,
+            'disabled': sort_disabled
+        }
+        search_bar.current_sorting = (self.sorting_enabled, self.sorting_order)
+        sorting_menu.aboutToShow.connect(
+            lambda: self.updateSortingMenu(
+                search_bar, list_content_type, stream_type
+            )
+        )
+
+        container = QWidget()
+        container_layout = QHBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(2)
+        container_layout.addWidget(search_bar)
+        # Keep the clear action beside the field it affects. It only empties the
+        # search text and never changes sorting or category visibility settings.
+        container_layout.addWidget(clear_button)
+        if list_content_type == 'category':
+            category_visibility_button = QToolButton()
+            category_visibility_button.setText("Categories")
+            category_visibility_button.setIcon(
+                self._category_icon(
+                    QColor("#f2f2f2" if application_palette_is_dark(QtWidgets.qApp)
+                           else "#202020")
+                )
+            )
+            category_visibility_button.setToolButtonStyle(
+                Qt.ToolButtonTextBesideIcon
+            )
+            category_visibility_button.setToolTip(
+                f"Choose which {stream_type} categories are displayed"
+            )
+            category_visibility_button.clicked.connect(
+                lambda: self.openCategoryVisibilityDialog(stream_type)
+            )
+            search_bar.category_visibility_button = category_visibility_button
+            container_layout.addWidget(category_visibility_button)
+        container_layout.addWidget(sort_button)
 
         #Connect function to process search bar key presses
         search_bar.keyPressEvent = lambda e: self.SearchBarKeyPressed(e, 
             search_bar, list_content_type, stream_type, list_widgets, search_history_list, search_history_list_idx)
+
+        return container
+
+    def openCategoryVisibilityDialog(self, stream_type):
+        """Open the visibility editor and apply accepted changes immediately."""
+        categories = self.categories_per_stream_type.get(stream_type, [])
+        if not categories:
+            QMessageBox.information(
+                self,
+                "Categories unavailable",
+                f"No {stream_type} categories have been loaded yet."
+            )
+            return
+
+        dialog = CategoryVisibilityDialog(
+            self,
+            stream_type,
+            categories,
+            self.hidden_category_ids[stream_type]
+        )
+        self._prepare_dialog_theme(dialog)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        self.hidden_category_ids[stream_type] = dialog.hidden_category_ids()
+        self._save_hidden_categories()
+
+        # All is derived from visible categories, so every cached representation for
+        # this content type becomes stale as soon as the exclusions change.
+        self.category_view_cache[stream_type].clear()
+        self.category_item_cache[stream_type].clear()
+        self.active_category_view_key[stream_type] = None
+        self._refresh_visible_categories(stream_type)
+
+    def _visible_categories(self, stream_type):
+        """Return provider categories that are not explicitly hidden by the user."""
+        hidden_ids = self.hidden_category_ids[stream_type]
+        return [
+            category
+            for category in self.categories_per_stream_type.get(stream_type, [])
+            if str(category.get('category_id', '')) not in hidden_ids
+        ]
+
+    def _entries_in_visible_categories(self, stream_type):
+        """Return entries included in the synthetic All view after exclusions."""
+        visible_category_ids = {
+            str(category.get('category_id'))
+            for category in self._visible_categories(stream_type)
+            if category.get('category_id') is not None
+        }
+        return [
+            entry
+            for entry in self.entries_per_stream_type.get(stream_type, [])
+            if entry.get('category_id') is not None
+            and str(entry.get('category_id')) in visible_category_ids
+        ]
+
+    def _refresh_visible_categories(self, stream_type):
+        """Rebuild one category column and preserve its selection when possible."""
+        previous_name, previous_id = self._selected_category(stream_type)
+        active_category_was_hidden = (
+            previous_name not in (
+                self.all_categories_text, self.fav_categories_text
+            )
+            and str(previous_id) in self.hidden_category_ids[stream_type]
+        )
+        self.currently_loaded_categories[stream_type] = self._visible_categories(
+            stream_type
+        )
+        if active_category_was_hidden:
+            # All must be available as the safe replacement selection.
+            self.category_search_bars[stream_type].clear()
+        search_text = self.category_search_bars[stream_type].text()
+        self.search_in_list('category', stream_type, search_text)
+
+        category_list = self.category_list_widgets[stream_type]
+        selected_row = -1
+        for row in range(category_list.count()):
+            item = category_list.item(row)
+            item_data = item.data(Qt.UserRole) or {}
+            if previous_name in (self.all_categories_text, self.fav_categories_text):
+                matches_previous = item.text() == previous_name
+            else:
+                matches_previous = (
+                    str(item_data.get('category_id', '')) == str(previous_id)
+                )
+            if matches_previous:
+                selected_row = row
+                break
+
+        if selected_row >= 0:
+            category_list.setCurrentRow(selected_row)
+            category_list.itemClicked.emit(category_list.item(selected_row))
+            return
+
+        # If the active category was just hidden, switch to All so the stream list
+        # cannot remain filled with content from a category no longer displayed.
+        if not search_text:
+            all_items = category_list.findItems(
+                self.all_categories_text, Qt.MatchExactly
+            )
+            if all_items:
+                category_list.setCurrentItem(all_items[0])
+                category_list.itemClicked.emit(all_items[0])
+
+    def _load_hidden_categories(self):
+        """Load independent LIVE, Movies, and Series exclusions from userdata.ini."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            return
+
+        if 'Hidden categories' not in config:
+            return
+
+        for stream_type in self.hidden_category_ids:
+            try:
+                hidden_ids = json.loads(
+                    config['Hidden categories'].get(stream_type, '[]')
+                )
+            except (TypeError, ValueError):
+                hidden_ids = []
+            if isinstance(hidden_ids, list):
+                self.hidden_category_ids[stream_type] = {
+                    str(category_id) for category_id in hidden_ids
+                }
+
+    def _save_hidden_categories(self):
+        """Persist category exclusions while preserving every unrelated setting."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+
+        config['Hidden categories'] = {
+            stream_type: json.dumps(sorted(hidden_ids), separators=(',', ':'))
+            for stream_type, hidden_ids in self.hidden_category_ids.items()
+        }
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+        except OSError as e:
+            print(f"Could not save hidden categories: {e}")
+
+    def updateSortingMenu(self, search_bar, list_content_type, stream_type):
+        """Check the action that matches the order of the list being displayed."""
+        remembers_current_category = (
+            self.remember_category_sorting
+            and list_content_type == 'streaming'
+            and (stream_type != 'Series' or self.series_navigation_level == 0)
+        )
+        if remembers_current_category:
+            category_name, category_id = self._selected_category(stream_type)
+            sorting_enabled, sort_order = self._sorting_for_category(
+                stream_type, category_name, category_id
+            )
+        else:
+            sorting_enabled, sort_order = getattr(
+                search_bar, 'current_sorting',
+                (self.sorting_enabled, self.sorting_order)
+            )
+
+        preference = self._sorting_preference_value(
+            sorting_enabled, sort_order
+        )
+        for action_name, action in search_bar.sort_actions.items():
+            action.setChecked(action_name == preference)
+
+    def applySortingChoice(
+        self, search_bar, list_content_type, stream_type, list_widgets,
+        sorting_enabled, sort_order
+    ):
+        """Apply a menu choice and persist it for the selected category if enabled."""
+        if self.remember_category_sorting and list_content_type == 'category':
+            self.category_list_sort_preferences[stream_type] = (
+                self._sorting_preference_value(sorting_enabled, sort_order)
+            )
+            self._save_category_sort_preferences()
+
+        if (
+            self.remember_category_sorting
+            and list_content_type == 'streaming'
+            and (stream_type != 'Series' or self.series_navigation_level == 0)
+        ):
+            category_name, category_id = self._selected_category(stream_type)
+            preference_key = self._category_sort_preference_key(
+                category_name, category_id
+            )
+            preference_value = self._sorting_preference_value(
+                sorting_enabled, sort_order
+            )
+            self.category_sort_preferences[stream_type][preference_key] = (
+                preference_value
+            )
+            self._save_category_sort_preferences()
+
+            # Prepared dictionaries and reusable Qt items contain a specific order.
+            # Discard this content type's caches so the new preference is used when
+            # the user leaves and later returns to the category.
+            self.category_view_cache[stream_type].clear()
+            self.category_item_cache[stream_type].clear()
+            self.active_category_view_key[stream_type] = None
+
+            prepared_entries = self._entries_for_category_view(
+                stream_type, category_name, category_id
+            )
+            self.currently_loaded_streams[stream_type] = list(prepared_entries)
+
+        self.sortList(
+            search_bar, list_content_type, stream_type, list_widgets,
+            sorting_enabled, sort_order
+        )
+
+        if self.remember_category_sorting and list_content_type == 'streaming':
+            category_name, category_id = self._selected_category(stream_type)
+            self.active_category_view_key[stream_type] = self._category_view_key(
+                stream_type, category_name, category_id
+            )
 
     def clearSearch(self, search_bar, list_content_type, stream_type, list_widgets, history_list_idx):
         #Clear search bar
@@ -541,10 +1675,36 @@ class IPTVPlayerApp(QMainWindow):
         self.search_in_list(list_content_type, stream_type, "")
 
     def sortList(self, search_bar, list_content_type, stream_type, list_widgets, sorting_enabled, sort_order):
+        # Keep the menu check mark synchronized even when a global setting invokes
+        # sorting directly instead of going through applySortingChoice().
+        search_bar.current_sorting = (sorting_enabled, sort_order)
         self.set_progress_bar(0, f"Sorting {stream_type} {list_content_type}")
 
         #Get list
         list_widget = list_widgets[stream_type]
+
+        # Top-level stream catalogs can contain tens of thousands of rows. Qt's
+        # native QListWidget sort runs entirely in the GUI thread and can freeze the
+        # whole application for several seconds. Sort the lightweight dictionaries
+        # first, then rebuild the widget in cooperative chunks.
+        is_top_level_stream_view = (
+            list_content_type == 'streaming'
+            and (stream_type != 'Series' or self.series_navigation_level == 0)
+        )
+        if is_top_level_stream_view:
+            ordered_entries = list(self.currently_loaded_streams[stream_type])
+            if sorting_enabled:
+                ordered_entries.sort(
+                    key=lambda entry: entry.get('name', '').casefold(),
+                    reverse=(sort_order == 1)
+                )
+
+            self.currently_loaded_streams[stream_type] = ordered_entries
+            self._replace_streaming_list_items(stream_type, ordered_entries)
+            self.set_progress_bar(
+                100, f"Finished sorting {stream_type} {list_content_type}"
+            )
+            return
 
         # The Seasons view (Series tab, navigation level 1) needs numeric ordering, not Qt's
         # default text sort — otherwise "Season 10" comes before "Season 2". Issue #18.
@@ -578,59 +1738,114 @@ class IPTVPlayerApp(QMainWindow):
             self.animate_progress(0, 100, f"Finished sorting {stream_type} {list_content_type}")
             return
 
-        #Enable or disable sorting
-        list_widget.setSortingEnabled(sorting_enabled)
-
-        #Remove 'All' and 'Favorites' category items
-        if list_content_type == 'category':
-            matches = []
-            for text in [self.all_categories_text, self.fav_categories_text]:
-                matches.extend(list_widget.findItems(text, Qt.MatchExactly))
-
-            for item in matches:
-                idx = list_widget.row(item)
-                list_widget.takeItem(idx)
-
-        if sorting_enabled:
-            #When sorting is enabled, set sort order, 0: A-Z, 1: Z-A
-            list_widget.sortItems(sort_order)
-
-        else:
-            #When sorting is disabled, reload list manually
-            if list_content_type == 'category':
-                self.category_list_widgets[stream_type].clear()
-
-                for entry in self.currently_loaded_categories[stream_type]:
-                    item = QListWidgetItem(entry['category_name'])
-                    item.setData(Qt.UserRole, entry)
-
-                    self.category_list_widgets[stream_type].addItem(item)
-
-            elif list_content_type == 'streaming':
-                self.streaming_list_widgets[stream_type].clear()
-
-                for entry in self.currently_loaded_streams[stream_type]:
-                    item = QListWidgetItem(entry['name'])
-                    item.setData(Qt.UserRole, entry)
-
-                    self.streaming_list_widgets[stream_type].addItem(item)
-
-        #Disable sorting
+        # Keep automatic sorting disabled while changing the list. Enabling it here
+        # already performs a sort, and the former explicit sortItems() call performed
+        # the same expensive work a second time for large Movie catalogs.
         list_widget.setSortingEnabled(False)
+        list_widget.setUpdatesEnabled(False)
 
-        if list_content_type == 'category':
-            #Add 'All' and 'Favorites' categories to top
-            itemAll = QListWidgetItem(self.all_categories_text)
-            itemAll.setData(Qt.UserRole, {'category_name': self.all_categories_text})
-            self.category_list_widgets[stream_type].insertItem(0, itemAll)
+        try:
+            #Remove 'All' and 'Favorites' category items
+            if list_content_type == 'category':
+                matches = []
+                for text in [self.all_categories_text, self.fav_categories_text]:
+                    matches.extend(list_widget.findItems(text, Qt.MatchExactly))
 
-            itemFav = QListWidgetItem(self.fav_categories_text)
-            itemFav.setData(Qt.UserRole, {'category_name': self.fav_categories_text})
-            self.category_list_widgets[stream_type].insertItem(1, itemFav)
+                for item in matches:
+                    idx = list_widget.row(item)
+                    list_widget.takeItem(idx)
+
+            if sorting_enabled:
+                # Perform exactly one native Qt sort after all items are present.
+                list_widget.sortItems(sort_order)
+
+            else:
+                #When sorting is disabled, reload list manually
+                if list_content_type == 'category':
+                    self.category_list_widgets[stream_type].clear()
+
+                    for entry in self.currently_loaded_categories[stream_type]:
+                        item = QListWidgetItem(entry['category_name'])
+                        item.setData(Qt.UserRole, entry)
+
+                        self.category_list_widgets[stream_type].addItem(item)
+
+                elif list_content_type == 'streaming':
+                    self.streaming_list_widgets[stream_type].clear()
+
+                    for entry in self.currently_loaded_streams[stream_type]:
+                        item = QListWidgetItem(entry['name'])
+                        item.setData(Qt.UserRole, entry)
+
+                        self.streaming_list_widgets[stream_type].addItem(item)
+
+            if list_content_type == 'category':
+                #Add 'All' and 'Favorites' categories to top
+                itemAll = QListWidgetItem(self.all_categories_text)
+                itemAll.setData(Qt.UserRole, {'category_name': self.all_categories_text})
+                self.category_list_widgets[stream_type].insertItem(0, itemAll)
+
+                itemFav = QListWidgetItem(self.fav_categories_text)
+                itemFav.setData(Qt.UserRole, {'category_name': self.fav_categories_text})
+                self.category_list_widgets[stream_type].insertItem(1, itemFav)
+        finally:
+            list_widget.setUpdatesEnabled(True)
+            list_widget.viewport().update()
 
         self.animate_progress(0, 100, f"Finished sorting {stream_type} {list_content_type}")
 
+    def _replace_streaming_list_items(self, stream_type, entries):
+        """Replace a large stream list while periodically yielding to Qt."""
+        list_widget = self.streaming_list_widgets[stream_type]
+        category_widget = self.category_list_widgets[stream_type]
+        chunk_size = 1000
+
+        list_widget.setSortingEnabled(False)
+        list_widget.setUpdatesEnabled(False)
+        category_widget.setEnabled(False)
+        try:
+            list_widget.clear()
+            total_entries = len(entries)
+            for start in range(0, total_entries, chunk_size):
+                chunk = entries[start:start + chunk_size]
+                first_row = list_widget.count()
+                list_widget.addItems([
+                    entry.get('name', '') for entry in chunk
+                ])
+                for offset, entry in enumerate(chunk):
+                    list_widget.item(first_row + offset).setData(Qt.UserRole, entry)
+
+                # Process pending paint and input events between chunks so switching
+                # tabs and using the rest of the application remains responsive.
+                self.set_progress_bar(
+                    int(min(99, ((start + len(chunk)) * 100) / total_entries)),
+                    f"Loading {stream_type} streams: "
+                    f"{start + len(chunk)} of {total_entries}"
+                )
+
+            if not entries:
+                list_widget.addItem("No items in list...")
+        finally:
+            category_widget.setEnabled(True)
+            list_widget.setUpdatesEnabled(True)
+            list_widget.viewport().update()
+
     def initIPTVinfo(self):
+        info_controls = QHBoxLayout()
+        self.refresh_account_info_button = QPushButton("Refresh")
+        self.refresh_account_info_button.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
+        )
+        self.refresh_account_info_button.setToolTip(
+            "Refresh account status and active connections only"
+        )
+        self.refresh_account_info_button.clicked.connect(self.refreshAccountInfo)
+        self.account_info_last_refresh_label = QLabel("Not refreshed yet")
+        info_controls.addWidget(self.refresh_account_info_button)
+        info_controls.addWidget(self.account_info_last_refresh_label)
+        info_controls.addStretch()
+        self.info_tab_layout.addLayout(info_controls)
+
         self.iptv_info_text = QTextEdit()
         self.iptv_info_text.setReadOnly(True)
 
@@ -641,9 +1856,9 @@ class IPTVPlayerApp(QMainWindow):
 
     def initCategoryListWidgets(self):
         #Create lists for categories
-        self.category_list_live     = QListWidget()
-        self.category_list_movies   = QListWidget()
-        self.category_list_series   = QListWidget()
+        self.category_list_live     = KeyboardNavigableListWidget()
+        self.category_list_movies   = KeyboardNavigableListWidget()
+        self.category_list_series   = KeyboardNavigableListWidget()
 
         #Enable sorting
         # self.category_list_live.setSortingEnabled(True)
@@ -654,6 +1869,12 @@ class IPTVPlayerApp(QMainWindow):
         self.category_list_live.itemClicked.connect(self.category_item_clicked)
         self.category_list_movies.itemClicked.connect(self.category_item_clicked)
         self.category_list_series.itemClicked.connect(self.category_item_clicked)
+        self.category_list_live.keyboardActivated.connect(self.category_item_clicked)
+        self.category_list_movies.keyboardActivated.connect(self.category_item_clicked)
+        self.category_list_series.keyboardActivated.connect(self.category_item_clicked)
+        self.category_list_live.keyboardSelected.connect(self.category_item_clicked)
+        self.category_list_movies.keyboardSelected.connect(self.category_item_clicked)
+        self.category_list_series.keyboardSelected.connect(self.category_item_clicked)
 
         #Put category lists in list
         self.category_list_widgets = {
@@ -668,17 +1889,25 @@ class IPTVPlayerApp(QMainWindow):
             list_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             list_widget.setIconSize(standard_icon_size)
             list_widget.setStyleSheet("""
+                QListWidget {
+                    background-color: palette(base);
+                    color: palette(text);
+                }
                 QListWidget::item {
                     padding-top: 5px;
                     padding-bottom: 5px;
+                }
+                QListWidget::item:selected {
+                    background-color: palette(highlight);
+                    color: palette(highlighted-text);
                 }
             """)
 
     def initEntryListWidgets(self):
         #Create lists for channels
-        self.streaming_list_live      = QListWidget()
-        self.streaming_list_movies    = QListWidget()
-        self.streaming_list_series    = QListWidget()
+        self.streaming_list_live      = KeyboardNavigableListWidget()
+        self.streaming_list_movies    = KeyboardNavigableListWidget()
+        self.streaming_list_series    = KeyboardNavigableListWidget()
 
         #Enable sorting
         # self.streaming_list_live.setSortingEnabled(True)
@@ -703,6 +1932,13 @@ class IPTVPlayerApp(QMainWindow):
         self.streaming_list_movies.itemClicked.connect(self.streaming_item_clicked)
         self.streaming_list_series.itemClicked.connect(self.streaming_item_clicked)
 
+        self.streaming_list_live.keyboardActivated.connect(self.streaming_item_keyboard_activated)
+        self.streaming_list_movies.keyboardActivated.connect(self.streaming_item_keyboard_activated)
+        self.streaming_list_series.keyboardActivated.connect(self.streaming_item_keyboard_activated)
+        self.streaming_list_live.keyboardSelected.connect(self.streaming_item_clicked)
+        self.streaming_list_movies.keyboardSelected.connect(self.streaming_item_clicked)
+        self.streaming_list_series.keyboardSelected.connect(self.streaming_item_clicked)
+
         #Put entry lists in list
         self.streaming_list_widgets = {
             'LIVE': self.streaming_list_live,
@@ -710,15 +1946,30 @@ class IPTVPlayerApp(QMainWindow):
             'Series': self.streaming_list_series,
         }
 
+        # Tab and Backtab switch directly between the two catalog columns.
+        for stream_type in ('LIVE', 'Movies', 'Series'):
+            category_list = self.category_list_widgets[stream_type]
+            streaming_list = self.streaming_list_widgets[stream_type]
+            category_list.setTabTarget(streaming_list)
+            streaming_list.setTabTarget(category_list)
+
         #Configure visuals of the lists
         standard_icon_size = QSize(24, 24)
         for list_widget in [self.streaming_list_live, self.streaming_list_movies, self.streaming_list_series]:
             list_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             list_widget.setIconSize(standard_icon_size)
             list_widget.setStyleSheet("""
+                QListWidget {
+                    background-color: palette(base);
+                    color: palette(text);
+                }
                 QListWidget::item {
                     padding-top: 5px;
                     padding-bottom: 5px;
+                }
+                QListWidget::item:selected {
+                    background-color: palette(highlight);
+                    color: palette(highlighted-text);
                 }
             """)
 
@@ -770,25 +2021,139 @@ class IPTVPlayerApp(QMainWindow):
         print(f"loading default sorting order: {sorting_order}")
 
         if not sorting_order:
-            #Set default order to A-Z
-            self.default_sorting_order_box.setCurrentText("A-Z")
+            # Keep the provider order for a new profile with no saved choice.
+            self.default_sorting_order_box.setCurrentText("Sorting disabled")
 
         else:
             self.default_sorting_order_box.setCurrentText(sorting_order)
+
+        self._load_category_sort_preferences(config)
 
         #Set sorting variables
         match self.default_sorting_order_box.currentText():
             case "A-Z":
                 self.sorting_enabled    = True
                 self.sorting_order      = 0
+                self.remember_category_sorting = False
 
             case "Z-A":
                 self.sorting_enabled    = True
                 self.sorting_order      = 1
 
+                self.remember_category_sorting = False
+
+            case "Remember per category":
+                # Unsaved categories inherit the last persisted global preference.
+                self.sorting_enabled    = True
+                self.sorting_order      = 0
+                self.remember_category_sorting = True
+
             case _:
                 self.sorting_enabled    = False
                 self.sorting_order      = 0
+                self.remember_category_sorting = False
+
+    def _load_category_sort_preferences(self, config):
+        """Load per-category sorting choices while tolerating malformed user data."""
+        if 'Category sorting' not in config:
+            return
+
+        saved_fallback = config['Category sorting'].get('fallback', 'a_z')
+        if saved_fallback in ('a_z', 'z_a', 'disabled'):
+            self.category_sort_fallback = saved_fallback
+
+        for stream_type in self.category_sort_preferences:
+            encoded_preferences = config['Category sorting'].get(stream_type, '{}')
+            try:
+                preferences = json.loads(encoded_preferences)
+            except (TypeError, ValueError):
+                preferences = {}
+
+            if isinstance(preferences, dict):
+                self.category_sort_preferences[stream_type] = {
+                    str(key): value
+                    for key, value in preferences.items()
+                    if value in ('a_z', 'z_a', 'disabled')
+                }
+
+            category_list_preference = config['Category sorting'].get(
+                f'{stream_type}_category_list', ''
+            )
+            if category_list_preference in ('a_z', 'z_a', 'disabled'):
+                self.category_list_sort_preferences[stream_type] = (
+                    category_list_preference
+                )
+
+    def _save_category_sort_preferences(self):
+        """Store durable sorting preferences in INI; IPTV cache remains disposable."""
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+
+        config['Category sorting'] = {
+            stream_type: json.dumps(preferences, separators=(',', ':'))
+            for stream_type, preferences in self.category_sort_preferences.items()
+        }
+        config['Category sorting']['fallback'] = self.category_sort_fallback
+        for stream_type, preference in self.category_list_sort_preferences.items():
+            config['Category sorting'][f'{stream_type}_category_list'] = preference
+
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+        except OSError as e:
+            print(f"Could not save category sorting preferences: {e}")
+
+    def _sorting_preference_value(self, sorting_enabled, sort_order):
+        if not sorting_enabled:
+            return 'disabled'
+        return 'z_a' if sort_order == 1 else 'a_z'
+
+    def _sorting_tuple_from_preference(self, preference):
+        if preference == 'disabled':
+            return False, 0
+        return True, 1 if preference == 'z_a' else 0
+
+    def _category_sort_preference_key(self, category_name, category_id=None):
+        """Use stable provider ids, with dedicated keys for synthetic categories."""
+        if category_name == self.all_categories_text:
+            return 'all'
+        if category_name == self.fav_categories_text:
+            return 'favorites'
+        return f"category:{category_id}"
+
+    def _selected_category(self, stream_type):
+        selected_item = self.category_list_widgets[stream_type].currentItem()
+        if selected_item is None:
+            return self.all_categories_text, None
+
+        category_name = selected_item.text()
+        category_data = selected_item.data(Qt.UserRole) or {}
+        return category_name, category_data.get('category_id')
+
+    def _sorting_for_category(self, stream_type, category_name, category_id=None):
+        if not self.remember_category_sorting:
+            return self.sorting_enabled, self.sorting_order
+
+        preference_key = self._category_sort_preference_key(
+            category_name, category_id
+        )
+        preference = self.category_sort_preferences[stream_type].get(
+            preference_key, self.category_sort_fallback
+        )
+        return self._sorting_tuple_from_preference(preference)
+
+    def _sorting_for_category_list(self, stream_type):
+        """Return the remembered order for a tab's category column."""
+        if not self.remember_category_sorting:
+            return self.sorting_enabled, self.sorting_order
+
+        preference = self.category_list_sort_preferences.get(
+            stream_type, self.category_sort_fallback
+        )
+        return self._sorting_tuple_from_preference(preference)
 
     def setAllSortingOrder(self, sorting_order):
         match sorting_order:
@@ -832,21 +2197,77 @@ class IPTVPlayerApp(QMainWindow):
             case "A-Z":
                 self.sorting_enabled    = True
                 self.sorting_order      = 0
+                self.remember_category_sorting = False
+                self.category_sort_fallback = 'a_z'
 
             case "Z-A":
                 self.sorting_enabled    = True
                 self.sorting_order      = 1
 
+                self.remember_category_sorting = False
+                self.category_sort_fallback = 'z_a'
+
+            case "Remember per category":
+                self.sorting_enabled    = True
+                self.sorting_order      = 0
+                self.remember_category_sorting = True
+
             case _:
                 self.sorting_enabled    = False
                 self.sorting_order      = 0
+                self.remember_category_sorting = False
+                self.category_sort_fallback = 'disabled'
 
-        self.setAllSortingOrder(sorting_order)
+        # Cached category views include the selected ordering, so discard them when
+        # the global sorting preference changes.
+        for stream_cache in self.category_view_cache.values():
+            stream_cache.clear()
+        for item_cache in self.category_item_cache.values():
+            item_cache.clear()
+        for stream_type in self.active_category_view_key:
+            self.active_category_view_key[stream_type] = None
+
+        if sorting_order == REMEMBER_CATEGORY_SORTING:
+            # Reapply both the category-column order and the preference for the
+            # category currently visible in each content tab.
+            for stream_type in self.streaming_list_widgets:
+                category_list_enabled, category_list_order = (
+                    self._sorting_for_category_list(stream_type)
+                )
+                self.sortList(
+                    self.category_search_bars[stream_type], 'category',
+                    stream_type, self.category_list_widgets,
+                    category_list_enabled, category_list_order
+                )
+                category_name, category_id = self._selected_category(stream_type)
+                enabled, order = self._sorting_for_category(
+                    stream_type, category_name, category_id
+                )
+                prepared_entries = self._entries_for_category_view(
+                    stream_type, category_name, category_id
+                )
+                self.currently_loaded_streams[stream_type] = list(
+                    prepared_entries
+                )
+                self.sortList(
+                    self.streaming_search_bars[stream_type], 'streaming',
+                    stream_type, self.streaming_list_widgets, enabled, order
+                )
+                self.active_category_view_key[stream_type] = (
+                    self._category_view_key(
+                        stream_type, category_name, category_id
+                    )
+                )
+        else:
+            self.setAllSortingOrder(sorting_order)
 
         config = configparser.ConfigParser()
         config.read(self.user_data_file)
 
         config['Sorting order'] = {'Order': sorting_order}
+        if 'Category sorting' not in config:
+            config.add_section('Category sorting')
+        config['Category sorting']['fallback'] = self.category_sort_fallback
 
         with open(self.user_data_file, 'w') as config_file:
             config.write(config_file)
@@ -861,45 +2282,99 @@ class IPTVPlayerApp(QMainWindow):
         self.address_book_button.setToolTip("Manage IPTV accounts")
         self.address_book_button.clicked.connect(self.open_address_book)
 
-        self.choose_player_button = QPushButton("Choose Media Player")
+        # Keep both player choices in one compact group. The radio buttons make the
+        # active mode explicit, while the read-only field exposes the external path
+        # without forcing the Settings tab to display a full-width status sentence.
+        self.player_group_box = QGroupBox("Media player")
+        self.player_group_layout = QGridLayout(self.player_group_box)
+
+        self.internal_player_radio = QRadioButton(
+            "Internal VLC (requires VLC installed on this computer)"
+        )
+        self.internal_player_radio.setToolTip(
+            "Play inside this application using the latest VLC installed on this computer"
+        )
+
+        self.external_player_radio = QRadioButton("External player")
+        self.external_player_radio.setToolTip(
+            "Play streams with an installed application such as VLC, MPV, or MPC-HC"
+        )
+
+        self.player_mode_group = QButtonGroup(self)
+        self.player_mode_group.setExclusive(True)
+        self.player_mode_group.addButton(self.internal_player_radio)
+        self.player_mode_group.addButton(self.external_player_radio)
+
+        self.external_player_path = QLineEdit()
+        self.external_player_path.setReadOnly(True)
+        self.external_player_path.setPlaceholderText("No external player selected")
+        self.external_player_path.setToolTip(
+            "Path kept for the external player, even while Internal VLC is active"
+        )
+
+        self.choose_player_button = QPushButton("Browse…")
         self.choose_player_button.setIcon(self.mediaplayer_icon)
-        self.choose_player_button.setToolTip("Set the Media Player used for watching content, use e.g. VLC or SMPlayer")
+        self.choose_player_button.setToolTip("Select an external media player executable")
         self.choose_player_button.clicked.connect(self.choose_external_player)
 
-        self.use_embedded_player_button = QPushButton("Use Internal Player (VLC)")
-        self.use_embedded_player_button.setIcon(self.mediaplayer_icon)
-        self.use_embedded_player_button.setToolTip(
-            "Play streams inside this window using the built-in libvlc backend.\n"
-            "Requires VLC to be installed on this machine — download from videolan.org."
+        self.internal_player_settings_button = QPushButton("Options…")
+        self.internal_player_settings_button.setToolTip(
+            "Configure seek, volume, and playback-speed steps"
         )
-        self.use_embedded_player_button.clicked.connect(self.use_embedded_player)
+        self.internal_player_settings_button.setEnabled(False)
+        self.internal_player_settings_button.clicked.connect(
+            self.openInternalPlayerSettings
+        )
 
         self.current_player_label = QLabel("")
         self.current_player_label.setStyleSheet("color: #5b8def;")
 
-        self.vods_enabled_checkbox = QCheckBox("VODs enabled")
-        self.vods_enabled_checkbox.setToolTip("Load the Movies/Series tabs for the IPTV account")
-        self.vods_enabled_checkbox.stateChanged.connect(self.toggleVODs)
+        self.internal_player_radio.toggled.connect(
+            lambda checked: self.use_embedded_player() if checked else None
+        )
+        self.internal_player_radio.toggled.connect(
+            self.internal_player_settings_button.setEnabled
+        )
+        self.external_player_radio.toggled.connect(self.use_external_player)
+
+        self.player_group_layout.addWidget(self.internal_player_radio, 0, 0)
+        # Align the internal options with the complete path-and-Browse area used
+        # by the external player row directly below it.
+        self.player_group_layout.addWidget(
+            self.internal_player_settings_button, 0, 1, 1, 2
+        )
+        self.player_group_layout.addWidget(self.external_player_radio, 1, 0)
+        self.player_group_layout.addWidget(self.external_player_path, 1, 1)
+        self.player_group_layout.addWidget(self.choose_player_button, 1, 2)
+        self.player_group_layout.addWidget(self.current_player_label, 2, 0, 1, 3)
+        self.player_group_layout.setColumnStretch(1, 1)
+
+        self.content_group_box = QGroupBox("Content")
+        self.content_group_layout = QHBoxLayout(self.content_group_box)
+        self.content_checkboxes = {}
+        for stream_type in ('LIVE', 'Movies', 'Series'):
+            checkbox = QCheckBox(stream_type)
+            checkbox.setToolTip(
+                f"Show the {stream_type} tab and load its data for the active account"
+            )
+            checkbox.stateChanged.connect(
+                lambda state, selected_type=stream_type:
+                self.toggleContentType(selected_type, state)
+            )
+            self.content_checkboxes[stream_type] = checkbox
+            self.content_group_layout.addWidget(checkbox)
+        self.content_group_layout.addStretch()
 
         self.keep_on_top_checkbox = QCheckBox("Keep on top")
         self.keep_on_top_checkbox.setToolTip("Keep the application on top of all windows")
         self.keep_on_top_checkbox.stateChanged.connect(self.toggleKeepOnTop)
 
         self.default_sorting_order_box = QComboBox()
-        self.default_sorting_order_box.addItems(["A-Z", "Z-A", "Sorting disabled"])
+        self.default_sorting_order_box.addItems([
+            "A-Z", "Z-A", "Sorting disabled", REMEMBER_CATEGORY_SORTING
+        ])
+        self.default_sorting_order_box.setCurrentText("Sorting disabled")
         self.default_sorting_order_box.currentTextChanged.connect(lambda e: self.setDefaultSortingOrder(e, self.default_sorting_order_box))
-
-        # self.cache_on_startup_checkbox = QCheckBox("Startup with cached data")
-        # self.cache_on_startup_checkbox.setToolTip("Loads the cached IPTV data on startup to reduce startup time.\nNote that the cached data only changes if you manually reload it once in a while.")
-        # self.cache_on_startup_checkbox.stateChanged.connect(self.toggle_cache_on_startup)
-
-        # self.reload_data_btn = QPushButton("Reload data")
-        # self.reload_data_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload))
-        # self.reload_data_btn.setToolTip("Click this to manually reload the IPTV data.\nNote that this only has effect if \'Startup with cached data\' is checked.")
-
-        self.select_user_agent_box = QComboBox()
-        self.select_user_agent_box.addItems(self.user_agents)
-        self.select_user_agent_box.currentTextChanged.connect(lambda e: self.userAgentSelected(e, self.select_user_agent_box))
 
         self.update_checker = QPushButton("Check for updates")
         self.update_checker.clicked.connect(lambda: self.checkForUpdates(True))
@@ -908,79 +2383,49 @@ class IPTVPlayerApp(QMainWindow):
         self.auto_update_checkbox.setToolTip("Automatically check for updates at startup")
         self.auto_update_checkbox.stateChanged.connect(self.toggleAutoUpdate)
 
-        self.stream_status_checkbox = QCheckBox("Show LIVE stream status indicator")
-        self.stream_status_checkbox.setToolTip(
-            "Show the green/red traffic light next to a LIVE channel.\n"
-            "Disable if your provider's stream status probes are flaky or slow."
+        self.advanced_network_button = QPushButton("Advanced settings…")
+        self.advanced_network_button.setToolTip(
+            "Configure request timeouts, Info refresh, LIVE status checks, retries, and User-Agent"
         )
-        self.stream_status_checkbox.stateChanged.connect(self.toggleStreamStatus)
+        self.advanced_network_button.clicked.connect(self.openNetworkSettings)
 
         self.theme_select_box = QComboBox()
         self.theme_select_box.addItems(["System", "Light", "Dark"])
         self.theme_select_box.setToolTip("Switch between Light, Dark, or follow the OS setting (default).")
         self.theme_select_box.currentTextChanged.connect(self.themeChanged)
 
-        #Set timeout integer validator
-        timeout_validator = QIntValidator(0, 999)
+        # Group the remaining preferences consistently with Media player and Content.
+        self.window_behavior_group_box = QGroupBox("Window behavior")
+        window_behavior_layout = QHBoxLayout(self.window_behavior_group_box)
+        window_behavior_layout.addWidget(self.keep_on_top_checkbox)
+        window_behavior_layout.addSpacing(30)
+        window_behavior_layout.addWidget(QLabel("Theme:"))
+        window_behavior_layout.addWidget(self.theme_select_box, 1)
 
-        self.set_connection_timeout = QLineEdit()
-        self.set_connection_timeout.setFixedWidth(100)
-        self.set_connection_timeout.setValidator(timeout_validator)
-        self.set_connection_timeout.returnPressed.connect(lambda: self.setTimeout(self.set_connection_timeout))
+        self.sorting_group_box = QGroupBox("Sorting")
+        sorting_layout = QHBoxLayout(self.sorting_group_box)
+        sorting_layout.addWidget(QLabel("Default sorting order:"))
+        sorting_layout.addWidget(self.default_sorting_order_box, 1)
 
-        self.set_read_timeout = QLineEdit()
-        self.set_read_timeout.setFixedWidth(100)
-        self.set_read_timeout.setValidator(timeout_validator)
-        self.set_read_timeout.returnPressed.connect(lambda: self.setTimeout(self.set_read_timeout))
+        self.advanced_settings_group_box = QGroupBox("Advanced settings")
+        advanced_settings_layout = QHBoxLayout(self.advanced_settings_group_box)
+        self.advanced_network_button.setText("Open advanced settings…")
+        advanced_settings_layout.addWidget(self.advanced_network_button)
 
-        self.set_live_status_timeout = QLineEdit()
-        self.set_live_status_timeout.setFixedWidth(100)
-        self.set_live_status_timeout.setValidator(timeout_validator)
-        self.set_live_status_timeout.returnPressed.connect(lambda: self.setTimeout(self.set_live_status_timeout))
+        self.updates_group_box = QGroupBox("Updates")
+        updates_layout = QHBoxLayout(self.updates_group_box)
+        updates_layout.addWidget(self.update_checker)
+        updates_layout.addWidget(self.auto_update_checkbox)
+        updates_layout.addStretch()
 
-        #Add widgets to settings tab layout
-        self.settings_layout.addWidget(self.address_book_button,                            0, 0)
-        self.settings_layout.addWidget(self.choose_player_button,                           0, 1)
-        self.settings_layout.addWidget(self.use_embedded_player_button,                     0, 2)
-        self.settings_layout.addWidget(self.current_player_label,                          10, 0, 1, 3)
-        self.settings_layout.addWidget(self.vods_enabled_checkbox,                          1, 0)
-        self.settings_layout.addWidget(self.keep_on_top_checkbox,                           2, 0)
-        self.settings_layout.addWidget(QLabel("Default sorting order: "),                   3, 0)
-        self.settings_layout.addWidget(self.default_sorting_order_box,                      3, 1)
-        self.settings_layout.addWidget(self.update_checker,                                 4, 0)
-        self.settings_layout.addWidget(self.auto_update_checkbox,                           4, 1)
-        self.settings_layout.addWidget(self.stream_status_checkbox,                         9, 0)
-        self.settings_layout.addWidget(QLabel("Theme: "),                                  11, 0)
-        self.settings_layout.addWidget(self.theme_select_box,                              11, 1)
-
-        #Advanced options
-        self.settings_layout.addWidget(QLabel("Select User-Agent (Advanced option): "),         5, 0)
-        self.settings_layout.addWidget(self.select_user_agent_box,                              5, 1)
-        self.settings_layout.addWidget(QLabel("Set connection timeout (Advanced option): "),    6, 0)
-        self.settings_layout.addWidget(self.set_connection_timeout,                             6, 1)
-        self.settings_layout.addWidget(QLabel("Set read timeout (Advanced option): "),          7, 0)
-        self.settings_layout.addWidget(self.set_read_timeout,                                   7, 1)
-        self.settings_layout.addWidget(QLabel("Set live status timeout (Advanced option): "),   8, 0)
-        self.settings_layout.addWidget(self.set_live_status_timeout,                            8, 1)
-
-        # self.settings_layout.addWidget(self.cache_on_startup_checkbox,  2, 0)
-        # self.settings_layout.addWidget(self.reload_data_btn,            3, 0)
-
-    def userAgentSelected(self, e, combobox):
-        #Get selected text
-        user_agent = combobox.currentText()
-
-        #Set current user agent
-        self.current_user_agent = user_agent
-
-        #Save selected user agent to userdata
-        config = configparser.ConfigParser()
-        config.read(self.user_data_file)
-
-        config['User-Agent'] = {'user-agent': user_agent}
-
-        with open(self.user_data_file, 'w') as config_file:
-            config.write(config_file)
+        # Keep the Settings page in the exact functional order shown to the user.
+        self.settings_layout.addWidget(self.address_book_button,             0, 0, 1, 2)
+        self.settings_layout.addWidget(self.content_group_box,               1, 0, 1, 2)
+        self.settings_layout.addWidget(self.window_behavior_group_box,       2, 0, 1, 2)
+        self.settings_layout.addWidget(self.sorting_group_box,               3, 0, 1, 2)
+        self.settings_layout.addWidget(self.player_group_box,                4, 0, 1, 2)
+        self.settings_layout.addWidget(self.advanced_settings_group_box,     5, 0, 1, 2)
+        self.settings_layout.addWidget(self.updates_group_box,               6, 0, 1, 2)
 
     def loadDefaultUserAgent(self):
         #Read userdata config file
@@ -996,10 +2441,7 @@ class IPTVPlayerApp(QMainWindow):
         else:
             self.current_user_agent = Threadpools.DEFAULT_USER_AGENT_HEADER
 
-        #Update combobox to selection
-        self.select_user_agent_box.setCurrentText(self.current_user_agent)
-
-    def loadDefaultVODs(self):
+    def loadDefaultContent(self):
         #Read userdata config file
         config = configparser.ConfigParser()
         try:
@@ -1007,98 +2449,267 @@ class IPTVPlayerApp(QMainWindow):
         except (configparser.Error, UnicodeDecodeError):
             config = configparser.ConfigParser()
 
-        #Check if defined in config. Otherwise set to default
-        if config.has_option('VOD', 'enabled'):
-            self.vods_enabled = (config['VOD']['enabled'] == 'True')
+        # Prefer the new independent values. An existing VOD preference remains a
+        # migration fallback for Movies and Series, so current users keep their choice.
+        def read_boolean(section, option, fallback):
+            try:
+                return config.getboolean(section, option, fallback=fallback)
+            except (ValueError, configparser.Error):
+                return fallback
+
+        if config.has_section('Content'):
+            for stream_type in self.content_enabled:
+                self.content_enabled[stream_type] = read_boolean(
+                    'Content', stream_type, True
+                )
         else:
-            self.vods_enabled = True
+            legacy_vods_enabled = read_boolean('VOD', 'enabled', True)
+            self.content_enabled = {
+                'LIVE': True,
+                'Movies': legacy_vods_enabled,
+                'Series': legacy_vods_enabled
+            }
 
-        #Update tabs to match config
-        self.tab_widget.setTabEnabled(1, self.vods_enabled)
-        self.tab_widget.setTabEnabled(2, self.vods_enabled)
+        self._applyContentVisibility()
 
-        #Update checkbox to match config
-        if self.vods_enabled:
-            self.vods_enabled_checkbox.setCheckState(Qt.Checked)
-        else:
-            self.vods_enabled_checkbox.setCheckState(Qt.Unchecked)
+        # Loading preferences must not trigger three redundant writes to userdata.ini.
+        for stream_type, checkbox in self.content_checkboxes.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(self.content_enabled[stream_type])
+            checkbox.blockSignals(False)
 
-    def setTimeout(self, lineedit):
-        try: 
-            #Get timeout value from lineedit
-            value = lineedit.text()
+    def _applyContentVisibility(self):
+        """Show only enabled content tabs while keeping Info and Settings available."""
+        tab_by_stream_type = {
+            'LIVE': self.live_tab,
+            'Movies': self.movies_tab,
+            'Series': self.series_tab
+        }
+        for stream_type, tab in tab_by_stream_type.items():
+            self.tab_widget.setTabVisible(
+                self.tab_widget.indexOf(tab),
+                self.content_enabled[stream_type]
+            )
 
-            #If value is invalid
-            if not value:
-                raise Exception(f"Value entered is not valid: {value}!")
+    def openNetworkSettings(self):
+        """Open the modal editor after all persisted network values are loaded."""
+        dialog = NetworkSettingsDialog(self)
+        self._prepare_dialog_theme(dialog)
+        dialog.exec_()
 
-            #Save selected user agent to userdata
-            config = configparser.ConfigParser()
+    def openInternalPlayerSettings(self):
+        """Edit and immediately apply the internal player's control steps."""
+        dialog = InternalPlayerSettingsDialog(self)
+        self._prepare_dialog_theme(dialog)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        self.internal_seek_step_seconds = dialog.seek_step.value()
+        self.internal_volume_step_percent = dialog.volume_step.value()
+        self.internal_speed_step = round(dialog.speed_step.value(), 2)
+        self.internal_audio_language = dialog.audio_language.currentData() or ""
+        self.internal_subtitle_language = dialog.subtitle_language.currentData() or ""
+        self.saveInternalPlayerSettings()
+
+        if self._embedded_player_command_queue is not None:
+            self._embedded_player_command_queue.put({
+                'command': 'control_steps',
+                'seek_seconds': self.internal_seek_step_seconds,
+                'volume_percent': self.internal_volume_step_percent,
+                'speed_step': self.internal_speed_step,
+                'audio_language': self.internal_audio_language,
+                'subtitle_language': self.internal_subtitle_language
+            })
+
+    def saveInternalPlayerSettings(self):
+        """Persist internal-player controls without replacing unrelated settings."""
+        config = configparser.ConfigParser()
+        try:
             config.read(self.user_data_file)
-
-            #If Timeouts section not yet exists create it
-            if "Timeouts" not in config:
-                config["Timeouts"] = {}
-
-            #Check which timeout value has been changed
-            match lineedit:
-                case self.set_connection_timeout:
-                    Threadpools.CONNECTION_TIMEOUT = int(value)
-
-                    config['Timeouts']['CONNECTION_TIMEOUT'] = value
-
-                case self.set_read_timeout:
-                    Threadpools.READ_TIMEOUT = int(value)
-
-                    config['Timeouts']['READ_TIMEOUT'] = value
-
-                case self.set_live_status_timeout:
-                    Threadpools.LIVE_STATUS_TIMEOUT = int(value)
-
-                    config['Timeouts']['LIVE_STATUS_TIMEOUT'] = value
-
-            #Write config file
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+        # Preserve the volume written by the isolated player process.
+        saved_volume = config.get('InternalPlayer', 'volume', fallback='80')
+        config['InternalPlayer'] = {
+            'seek_step_seconds': str(self.internal_seek_step_seconds),
+            'volume_step_percent': str(self.internal_volume_step_percent),
+            'speed_step': str(self.internal_speed_step),
+            'audio_language': self.internal_audio_language,
+            'subtitle_language': self.internal_subtitle_language,
+            'volume': saved_volume
+        }
+        try:
             with open(self.user_data_file, 'w') as config_file:
                 config.write(config_file)
+        except OSError as error:
+            print(f"Could not save internal player settings: {error}")
 
-            self.animate_progress(0, 100, f"Succesfully adjusted setting")
-
-        except Exception as e:
-            # print("Failed setting timeout: ")
-            self.animate_progress(0, 100, f"Failed setting timeout: {e}")
-
-    def loadDefaultTimeout(self):
+    def loadDefaultInternalPlayerSettings(self):
+        """Load bounded control steps so manual INI edits remain safe."""
+        config = configparser.ConfigParser()
         try:
-            #Read userdata config file
-            config = configparser.ConfigParser()
             config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
 
-            #Set default values
-            tmp_connection_timeout  = str(Threadpools.CONNECTION_TIMEOUT)
-            tmp_read_timeout        = str(Threadpools.READ_TIMEOUT)
-            tmp_live_status_timeout = str(Threadpools.LIVE_STATUS_TIMEOUT)
+        try:
+            seek_seconds = config.getint(
+                'InternalPlayer', 'seek_step_seconds',
+                fallback=DEFAULT_INTERNAL_SEEK_STEP_SECONDS
+            )
+        except (ValueError, configparser.Error):
+            seek_seconds = DEFAULT_INTERNAL_SEEK_STEP_SECONDS
+        try:
+            volume_percent = config.getint(
+                'InternalPlayer', 'volume_step_percent',
+                fallback=DEFAULT_INTERNAL_VOLUME_STEP_PERCENT
+            )
+        except (ValueError, configparser.Error):
+            volume_percent = DEFAULT_INTERNAL_VOLUME_STEP_PERCENT
+        try:
+            speed_step = config.getfloat(
+                'InternalPlayer', 'speed_step',
+                fallback=DEFAULT_INTERNAL_SPEED_STEP
+            )
+        except (ValueError, configparser.Error):
+            speed_step = DEFAULT_INTERNAL_SPEED_STEP
 
-            #Check if defined in config
+        self.internal_seek_step_seconds = max(1, min(seek_seconds, 300))
+        self.internal_volume_step_percent = max(1, min(volume_percent, 25))
+        self.internal_speed_step = max(0.05, min(round(speed_step, 2), 1.0))
+        valid_languages = {code for _, code in MEDIA_LANGUAGE_OPTIONS}
+        audio_language = config.get('InternalPlayer', 'audio_language', fallback='')
+        subtitle_language = config.get('InternalPlayer', 'subtitle_language', fallback='')
+        self.internal_audio_language = (
+            audio_language if audio_language in valid_languages else ''
+        )
+        self.internal_subtitle_language = (
+            subtitle_language
+            if subtitle_language in valid_languages | {'disabled'} else ''
+        )
+
+    def applyNetworkSettings(self, user_agent, connection_timeout, read_timeout,
+                             live_status_timeout, live_status_retries,
+                             stream_status_enabled, account_refresh_interval,
+                             account_auto_refresh_enabled, catalog_cache_enabled,
+                             catalog_cache_max_age_hours):
+        """Apply and persist all advanced provider settings in one operation."""
+        self.current_user_agent = user_agent or Threadpools.DEFAULT_USER_AGENT_HEADER
+        Threadpools.CONNECTION_TIMEOUT = connection_timeout
+        Threadpools.READ_TIMEOUT = read_timeout
+        Threadpools.LIVE_STATUS_TIMEOUT = live_status_timeout
+        Threadpools.LIVE_STATUS_RETRIES = live_status_retries
+        self.stream_status_enabled = stream_status_enabled
+        self.account_info_refresh_interval = account_refresh_interval
+        self.account_info_auto_refresh_enabled = account_auto_refresh_enabled
+        self.catalog_cache_enabled = catalog_cache_enabled
+        self.catalog_cache_max_age_hours = catalog_cache_max_age_hours
+        self._applyStreamStatusVisibility()
+        self._updateAccountInfoTimer()
+
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+
+        config['User-Agent'] = {'user-agent': self.current_user_agent}
+        config['Timeouts'] = {
+            'CONNECTION_TIMEOUT': str(connection_timeout),
+            'READ_TIMEOUT': str(read_timeout),
+            'LIVE_STATUS_TIMEOUT': str(live_status_timeout),
+            'LIVE_STATUS_RETRIES': str(live_status_retries)
+        }
+        config['StreamStatus'] = {'enabled': str(stream_status_enabled)}
+        config['AccountInfo'] = {
+            'refresh_interval': str(account_refresh_interval),
+            'auto_refresh_enabled': str(account_auto_refresh_enabled)
+        }
+        config['CatalogCache'] = {
+            'enabled': str(catalog_cache_enabled),
+            'max_age_hours': str(catalog_cache_max_age_hours)
+        }
+
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+            self.animate_progress(0, 100, "Network settings saved")
+        except OSError as e:
+            print(f"Could not write user data file: {e}")
+            self.animate_progress(0, 100, f"Failed saving network settings: {e}", "error")
+
+    def loadDefaultNetworkOptions(self):
+        try:
+            # Read persisted network values. A malformed file falls back to the
+            # in-code defaults instead of preventing the application from starting.
+            config = configparser.ConfigParser()
+            try:
+                config.read(self.user_data_file)
+            except (configparser.Error, UnicodeDecodeError):
+                config = configparser.ConfigParser()
+
+            # Clamp manually edited values to the same ranges as the dialog. Each
+            # value falls back independently, so one bad entry cannot discard the rest.
+            def read_bounded_integer(option, default, minimum, maximum):
+                try:
+                    value = config.getint("Timeouts", option, fallback=default)
+                except (ValueError, configparser.Error):
+                    value = default
+                return max(minimum, min(value, maximum))
+
             if config.has_section("Timeouts"):
-                if config.has_option("Timeouts", "CONNECTION_TIMEOUT"):
-                    #Set connection timeout if defined
-                    Threadpools.CONNECTION_TIMEOUT = int(config['Timeouts']['CONNECTION_TIMEOUT'])
-                    tmp_connection_timeout = config['Timeouts']['CONNECTION_TIMEOUT']
+                Threadpools.CONNECTION_TIMEOUT = read_bounded_integer(
+                    "CONNECTION_TIMEOUT", Threadpools.DEFAULT_CONNECTION_TIMEOUT, 1, 999
+                )
+                Threadpools.READ_TIMEOUT = read_bounded_integer(
+                    "READ_TIMEOUT", Threadpools.DEFAULT_READ_TIMEOUT, 1, 999
+                )
+                Threadpools.LIVE_STATUS_TIMEOUT = read_bounded_integer(
+                    "LIVE_STATUS_TIMEOUT", Threadpools.DEFAULT_LIVE_STATUS_TIMEOUT, 1, 999
+                )
+                Threadpools.LIVE_STATUS_RETRIES = read_bounded_integer(
+                    "LIVE_STATUS_RETRIES", Threadpools.DEFAULT_LIVE_STATUS_RETRIES,
+                    0, Threadpools.MAX_LIVE_STATUS_RETRIES
+                )
 
-                if config.has_option("Timeouts", "READ_TIMEOUT"):
-                    #Set read timeout if defined
-                    Threadpools.READ_TIMEOUT = int(config['Timeouts']['READ_TIMEOUT'])
-                    tmp_read_timeout = config['Timeouts']['READ_TIMEOUT']
+            try:
+                self.account_info_refresh_interval = config.getint(
+                    'AccountInfo', 'refresh_interval',
+                    fallback=Threadpools.DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL
+                )
+            except (ValueError, configparser.Error):
+                self.account_info_refresh_interval = (
+                    Threadpools.DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL
+                )
+            self.account_info_refresh_interval = max(
+                10, min(self.account_info_refresh_interval, 3600)
+            )
+            try:
+                self.account_info_auto_refresh_enabled = config.getboolean(
+                    'AccountInfo', 'auto_refresh_enabled', fallback=True
+                )
+            except (ValueError, configparser.Error):
+                self.account_info_auto_refresh_enabled = True
+            self._updateAccountInfoTimer()
 
-                if config.has_option("Timeouts", "LIVE_STATUS_TIMEOUT"):
-                    #Set live status timeout if defined
-                    Threadpools.LIVE_STATUS_TIMEOUT = int(config['Timeouts']['LIVE_STATUS_TIMEOUT'])
-                    tmp_live_status_timeout = config['Timeouts']['LIVE_STATUS_TIMEOUT']
-                    
-            #Set values in corresponding LineEdit widgets
-            self.set_connection_timeout.setText(tmp_connection_timeout)
-            self.set_read_timeout.setText(tmp_read_timeout)
-            self.set_live_status_timeout.setText(tmp_live_status_timeout)
+            try:
+                self.catalog_cache_enabled = config.getboolean(
+                    'CatalogCache', 'enabled', fallback=True
+                )
+            except (ValueError, configparser.Error):
+                self.catalog_cache_enabled = True
+            try:
+                self.catalog_cache_max_age_hours = config.getint(
+                    'CatalogCache', 'max_age_hours',
+                    fallback=Threadpools.DEFAULT_CATALOG_CACHE_MAX_AGE_HOURS
+                )
+            except (ValueError, configparser.Error):
+                self.catalog_cache_max_age_hours = (
+                    Threadpools.DEFAULT_CATALOG_CACHE_MAX_AGE_HOURS
+                )
+            self.catalog_cache_max_age_hours = max(
+                1, min(self.catalog_cache_max_age_hours, 720)
+            )
 
         except Exception as e:
             print(f"Failed loading default timeout values: {e}")
@@ -1129,10 +2740,17 @@ class IPTVPlayerApp(QMainWindow):
             #carry a higher version number.
             if self._version_tuple(latest_version) > self._version_tuple(CURRENT_VERSION):
                 #If not up to date ask if user wants to go to download page
-                reply = QMessageBox.question(self, 'Update Available',
-                                             f"A new version ({latest_version}) is available.\n"
-                                             "Do you want to visit the download page?",
-                                             QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                update_dialog = QMessageBox(self)
+                update_dialog.setIcon(QMessageBox.Question)
+                update_dialog.setWindowTitle('Update Available')
+                update_dialog.setText(
+                    f"A new version ({latest_version}) is available.\n"
+                    "Do you want to visit the download page?"
+                )
+                update_dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+                update_dialog.setDefaultButton(QMessageBox.Yes)
+                self._prepare_dialog_theme(update_dialog)
+                reply = update_dialog.exec_()
 
                 #If user wants to go to download page, open latest version page
                 if reply == QMessageBox.Yes:
@@ -1142,7 +2760,13 @@ class IPTVPlayerApp(QMainWindow):
 
             #Current version is up to date
             elif enable_update_msg:
-                QMessageBox.information(self, 'No Update', "You are using the latest version.")
+                update_dialog = QMessageBox(self)
+                update_dialog.setIcon(QMessageBox.Information)
+                update_dialog.setWindowTitle('No Update')
+                update_dialog.setText("You are using the latest version.")
+                update_dialog.setStandardButtons(QMessageBox.Ok)
+                self._prepare_dialog_theme(update_dialog)
+                update_dialog.exec_()
 
             else:
                 self.animate_progress(0, 100, "No update available")
@@ -1151,9 +2775,15 @@ class IPTVPlayerApp(QMainWindow):
             print(f"Failed update checker: {e}")
 
             if enable_update_msg:
-                QMessageBox.warning(self, 'Failed update checker', "Failed checking for updates.\nPlease try again.")
+                update_dialog = QMessageBox(self)
+                update_dialog.setIcon(QMessageBox.Warning)
+                update_dialog.setWindowTitle('Failed update checker')
+                update_dialog.setText("Failed checking for updates.\nPlease try again.")
+                update_dialog.setStandardButtons(QMessageBox.Ok)
+                self._prepare_dialog_theme(update_dialog)
+                update_dialog.exec_()
             else:
-                self.animate_progress(0, 100, "Failed checking for updates")
+                self.animate_progress(0, 100, "Failed checking for updates", "error")
 
     def toggleAutoUpdate(self, state):
         checked = bool(state)
@@ -1208,13 +2838,21 @@ class IPTVPlayerApp(QMainWindow):
         self.progress_bar.setMaximum(100)
         self.progress_bar.setFixedHeight(25)
         self.progress_bar.setTextVisible(True)
+        self.set_progress_state("busy")
 
         #Animate progress bar
         self.playlist_progress_animation = QPropertyAnimation(self.progress_bar, b"value")
         self.playlist_progress_animation.setDuration(1000)  # longer duration for smoother animation
         self.playlist_progress_animation.setEasingCurve(QEasingCurve.InOutQuad)
+        self._progress_animation_final_state = "success"
+        self.playlist_progress_animation.finished.connect(
+            self._finish_progress_animation
+        )
 
     def loadDataAtStartup(self):
+        # Load internal-player steps before a startup account can launch media.
+        self.loadDefaultInternalPlayerSettings()
+
         #Load external media player
         self.external_player_command = self.load_external_player_command()
         self._refresh_current_player_label()
@@ -1222,11 +2860,14 @@ class IPTVPlayerApp(QMainWindow):
         #Load default sorting setting
         self.loadDefaultSortingOrder()
 
+        #Load category exclusions before provider data populates the three columns
+        self._load_hidden_categories()
+
         #Load default user agent
         self.loadDefaultUserAgent()
 
-        #Load if VODs enabled
-        self.loadDefaultVODs()
+        #Load independent LIVE, Movies, and Series availability
+        self.loadDefaultContent()
 
         #Load default auto update checker
         self.loadDefaultAutoUpdate()
@@ -1237,11 +2878,12 @@ class IPTVPlayerApp(QMainWindow):
         #Apply persisted theme (Light / Dark / System) — default System
         self.loadDefaultTheme()
 
+        # Load network and cache preferences before startup credentials can begin
+        # provider requests in the background.
+        self.loadDefaultNetworkOptions()
+
         #Load startup credentials
         self.loadStartupCredentials()
-
-        #Load default timeouts
-        self.loadDefaultTimeout()
 
     def loadStartupCredentials(self):
         # Load playlist on startup if enabled. A malformed/missing key here used to crash
@@ -1300,55 +2942,38 @@ class IPTVPlayerApp(QMainWindow):
             self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
         self.show()
 
-    def _is_system_dark(self):
-        # On Windows 10/11, AppsUseLightTheme=0 means dark, 1 means light.
-        # Other OSes: fall back to checking the current palette's window-bg luminance.
-        if is_windows:
-            try:
-                import winreg
-                with winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER,
-                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-                ) as key:
-                    value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-                    return value == 0
-            except OSError:
-                return False
-        try:
-            app = QtWidgets.qApp
-            bg = app.palette().color(QPalette.Window)
-            # Rough perceived-luminance check.
-            return (0.299 * bg.red() + 0.587 * bg.green() + 0.114 * bg.blue()) < 128
-        except Exception:
-            return False
-
     def _apply_theme(self, theme_name):
-        # Theme names: "System", "Light", "Dark". Anything else falls back to System.
-        app = QtWidgets.qApp
-        if theme_name == "Dark" or (theme_name == "System" and self._is_system_dark()):
-            palette = QPalette()
-            palette.setColor(QPalette.Window,          QColor(45, 45, 48))
-            palette.setColor(QPalette.WindowText,      Qt.white)
-            palette.setColor(QPalette.Base,            QColor(30, 30, 30))
-            palette.setColor(QPalette.AlternateBase,   QColor(45, 45, 48))
-            palette.setColor(QPalette.ToolTipBase,     QColor(45, 45, 48))
-            palette.setColor(QPalette.ToolTipText,     Qt.white)
-            palette.setColor(QPalette.Text,            Qt.white)
-            palette.setColor(QPalette.Button,          QColor(45, 45, 48))
-            palette.setColor(QPalette.ButtonText,      Qt.white)
-            palette.setColor(QPalette.BrightText,      Qt.red)
-            palette.setColor(QPalette.Link,            QColor(91, 141, 239))
-            palette.setColor(QPalette.Highlight,       QColor(91, 141, 239))
-            palette.setColor(QPalette.HighlightedText, Qt.black)
-            palette.setColor(QPalette.Disabled, QPalette.Text,       QColor(127, 127, 127))
-            palette.setColor(QPalette.Disabled, QPalette.ButtonText, QColor(127, 127, 127))
-            app.setPalette(palette)
-        else:
-            # Fusion's built-in light palette.
-            app.setPalette(app.style().standardPalette())
+        dark = apply_application_theme(QtWidgets.qApp, theme_name)
+        apply_windows_title_bar_theme(self, dark)
+        self._refresh_theme_icons(dark)
+        # Qt style-sheet palette references are resolved when the sheet is set.
+        # Reapply list sheets so switching Dark -> Light updates existing widgets.
+        list_widgets = (
+            list(getattr(self, 'category_list_widgets', {}).values())
+            + list(getattr(self, 'streaming_list_widgets', {}).values())
+        )
+        for list_widget in list_widgets:
+            style_sheet = list_widget.styleSheet()
+            list_widget.setStyleSheet("")
+            list_widget.setPalette(QtWidgets.qApp.palette())
+            list_widget.setStyleSheet(style_sheet)
+            list_widget.viewport().update()
+
+    def _prepare_dialog_theme(self, dialog):
+        """Apply the current palette and native title-bar theme to a dialog."""
+        dialog.setPalette(QtWidgets.qApp.palette())
+        apply_windows_title_bar_theme(
+            dialog, application_palette_is_dark(QtWidgets.qApp)
+        )
 
     def themeChanged(self, theme_name):
         self._apply_theme(theme_name)
+        # Keep an already-open isolated player synchronized with Settings.
+        if self._embedded_player_command_queue is not None:
+            self._embedded_player_command_queue.put({
+                'command': 'theme',
+                'theme': theme_name
+            })
         config = configparser.ConfigParser()
         try:
             config.read(self.user_data_file)
@@ -1379,31 +3004,19 @@ class IPTVPlayerApp(QMainWindow):
         self.theme_select_box.blockSignals(False)
         self._apply_theme(mode)
 
-    def toggleStreamStatus(self, state):
-        checked = bool(state)
-        self.stream_status_enabled = checked
-
-        # Reset the indicator to "unknown" when disabling so the UI doesn't keep a
-        # stale green/red dot from the previous probe.
-        if not checked:
-            try:
+    def _applyStreamStatusVisibility(self):
+        """Keep the indicator visibility consistent with the no-probe preference."""
+        # Hiding the widget also releases its reserved space in the title layout.
+        # More importantly, startOnlineWorker() uses the same flag to avoid sending
+        # any future probe request to the IPTV provider.
+        try:
+            self.live_info_box.stream_status.setVisible(self.stream_status_enabled)
+            if not self.stream_status_enabled:
                 self.live_info_box.stream_status.setPixmap(
-                    QPixmap(self.path_to_unknown_status_icon).scaledToWidth(24)
+                    self.statusPixmap(self.path_to_unknown_status_icon, 24)
                 )
-            except Exception:
-                pass
-
-        config = configparser.ConfigParser()
-        try:
-            config.read(self.user_data_file)
-        except (configparser.Error, UnicodeDecodeError):
-            config = configparser.ConfigParser()
-        config['StreamStatus'] = {'enabled': str(checked)}
-        try:
-            with open(self.user_data_file, 'w') as config_file:
-                config.write(config_file)
-        except OSError as e:
-            print(f"Could not write user data file: {e}")
+        except Exception:
+            pass
 
     def loadDefaultStreamStatus(self):
         config = configparser.ConfigParser()
@@ -1417,22 +3030,38 @@ class IPTVPlayerApp(QMainWindow):
         else:
             self.stream_status_enabled = True
 
-        self.stream_status_checkbox.setCheckState(
-            Qt.Checked if self.stream_status_enabled else Qt.Unchecked
-        )
+        self._applyStreamStatusVisibility()
 
-    def toggleVODs(self, state):
-        checked = bool(state)
-
-        self.vods_enabled = checked
-        self.tab_widget.setTabEnabled(1, checked)
-        self.tab_widget.setTabEnabled(2, checked)
+    def toggleContentType(self, stream_type, state):
+        """Persist one content choice and immediately update tab visibility."""
+        was_enabled = self.content_enabled[stream_type]
+        is_enabled = bool(state)
+        self.content_enabled[stream_type] = is_enabled
+        self._applyContentVisibility()
 
         config = configparser.ConfigParser()
-        config.read(self.user_data_file)
-        config['VOD'] = {'enabled': checked}
-        with open(self.user_data_file, 'w') as config_file:
-            config.write(config_file)
+        try:
+            config.read(self.user_data_file)
+        except (configparser.Error, UnicodeDecodeError):
+            config = configparser.ConfigParser()
+        config['Content'] = {
+            key: str(enabled)
+            for key, enabled in self.content_enabled.items()
+        }
+        try:
+            with open(self.user_data_file, 'w') as config_file:
+                config.write(config_file)
+        except OSError as e:
+            print(f"Could not write user data file: {e}")
+
+        # A newly visible tab needs provider data immediately. Reload every enabled
+        # type as one consistent snapshot; the worker still skips disabled endpoints.
+        # With no active account, the normal login path will load it later.
+        if is_enabled and not was_enabled and all(
+            (self.server, self.username, self.password)
+        ):
+            self.set_progress_bar(0, "Reloading enabled content...")
+            self.fetch_data_thread()
     
     def toggle_cache_on_startup(self, state):
         if state == Qt.Checked:
@@ -1469,7 +3098,7 @@ class IPTVPlayerApp(QMainWindow):
         from urllib.parse import urlparse, parse_qs
 
         def _show_invalid():
-            self.animate_progress(0, 100, "Invalid m3u_plus or m3u URL")
+            self.animate_progress(0, 100, "Invalid m3u_plus or m3u URL", "error")
             dlg = QMessageBox(self)
             dlg.setWindowTitle("Error!")
             dlg.setText("M3U plus URL is invalid!\nPlease enter a valid Xtream get.php URL.")
@@ -1500,10 +3129,17 @@ class IPTVPlayerApp(QMainWindow):
                 try:
                     resp = requests.head(url, allow_redirects=True, timeout=5)
                     if resp.url and resp.url != url:
-                        print(f"Resolved shortened URL: {url} -> {resp.url}")
+                        print(
+                            "Resolved shortened URL: "
+                            f"{private_url_log_reference(url)} -> "
+                            f"{private_url_log_reference(resp.url)}"
+                        )
                         result = _parse(resp.url)
                 except requests.RequestException as e:
-                    print(f"Could not resolve URL '{url}': {e}")
+                    print(
+                        "Could not resolve URL "
+                        f"{private_url_log_reference(url)}: {e}"
+                    )
 
             if result:
                 self.server, self.username, self.password = result
@@ -1513,7 +3149,7 @@ class IPTVPlayerApp(QMainWindow):
             return False
         except Exception as e:
             print(f"Error extracting credentials: {e}")
-            self.animate_progress(0, 100, "Error extracting credentials")
+            self.animate_progress(0, 100, "Error extracting credentials", "error")
             return False
 
     def set_progress_text(self, text):
@@ -1521,18 +3157,63 @@ class IPTVPlayerApp(QMainWindow):
         QtWidgets.qApp.processEvents()
         # QtWidgets.qApp.sendPostedEvents()
 
-    def set_progress_bar(self, val, text):
+    def set_progress_state(self, state):
+        """Apply a stable visual state without relying on message wording."""
+        colors = {
+            "busy": "#2d8fd5",
+            "success": "#2ea44f",
+            "error": "#d64545"
+        }
+        if state not in colors:
+            state = "busy"
+
+        self.progress_bar.setProperty("progressState", state)
+        self.progress_bar.setStyleSheet(
+            "QProgressBar {"
+            " border: 1px solid palette(mid);"
+            " border-radius: 3px;"
+            " background-color: palette(base);"
+            " color: palette(text);"
+            " text-align: center;"
+            "}"
+            f"QProgressBar::chunk {{ background-color: {colors[state]}; }}"
+        )
+
+    def set_progress_bar(self, val, text, state=None):
+        # Values below 100 describe work in progress. A completed operation defaults
+        # to green; callers explicitly pass "error" for unsuccessful completion.
+        progress_state = state or ("success" if val >= 100 else "busy")
+        self.set_progress_state(progress_state)
         self.progress_bar.setFormat(text)
-        self.progress_bar.setValue(val)
+        if progress_state == "busy" and val <= 0:
+            # Qt hides the format text while a QProgressBar uses its indeterminate
+            # 0..0 range. A full blue bar communicates the unknown-duration busy
+            # state while keeping the operation message visible in the center.
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(val)
         QtWidgets.qApp.processEvents()
 
-    def animate_progress(self, start, end, text):
+    def animate_progress(self, start, end, text, state=None):
         self.playlist_progress_animation.stop()
+        self.progress_bar.setRange(0, 100)
         self.playlist_progress_animation.setStartValue(start)
         self.playlist_progress_animation.setEndValue(end)
+        self._progress_animation_final_state = state or (
+            "success" if end >= 100 else "busy"
+        )
+        # Keep the bar blue during the animation, then expose the final result when
+        # the target value is reached.
+        self.set_progress_state("busy")
         self.set_progress_text(text)
         self.playlist_progress_animation.start()
         QtWidgets.qApp.processEvents()
+
+    def _finish_progress_animation(self):
+        """Apply the success or failure color selected by animate_progress()."""
+        self.set_progress_state(self._progress_animation_final_state)
 
     def login(self):
         # When logging into another server, reset the progress bar
@@ -1559,8 +3240,20 @@ class IPTVPlayerApp(QMainWindow):
 
         self.set_progress_bar(0, "Going to fetch data...")
 
-    def fetch_data_thread(self):
-        dataWorker = FetchDataWorker(self.server, self.username, self.password, self.live_url_format, self.movie_url_format, self.series_url_format, self, self.vods_enabled)
+    def fetch_data_thread(self, force_refresh=False):
+        dataWorker = FetchDataWorker(
+            self.server,
+            self.username,
+            self.password,
+            self.live_url_format,
+            self.movie_url_format,
+            self.series_url_format,
+            self,
+            self.content_enabled,
+            self.catalog_cache_enabled,
+            self.catalog_cache_max_age_hours,
+            force_refresh
+        )
         dataWorker.signals.finished.connect(self.process_data)
         dataWorker.signals.error.connect(self.on_fetch_data_error)
         dataWorker.signals.progress_bar.connect(self.animate_progress)
@@ -1568,93 +3261,184 @@ class IPTVPlayerApp(QMainWindow):
         dataWorker.signals.show_info_msg.connect(self.show_info_msg)
         self.threadpool.start(dataWorker)
 
+    def refreshProviderCatalog(self):
+        """Fetch every enabled provider collection while retaining cache fallback."""
+        if not self.server or not self.username or not self.password:
+            self.show_info_msg("No account selected", "Select an IPTV account first.")
+            return
+        self.set_progress_bar(0, "Refreshing provider catalog...")
+        self.fetch_data_thread(force_refresh=True)
+
+    def _isInfoTabVisible(self):
+        """Return whether Info is the currently selected visible tab."""
+        return self.tab_widget.currentWidget() is self.info_tab
+
+    def _updateAccountInfoTimer(self):
+        """Run automatic refreshes only while Info is selected and enabled."""
+        should_run = (
+            self.account_info_auto_refresh_enabled
+            and self._isInfoTabVisible()
+            and bool(self.server and self.username and self.password)
+        )
+        if should_run:
+            self.account_info_timer.start(
+                self.account_info_refresh_interval * 1000
+            )
+        else:
+            self.account_info_timer.stop()
+
+    def _onCurrentTabChanged(self, _index):
+        """Refresh immediately on Info, then start or stop its periodic timer."""
+        self._updateAccountInfoTimer()
+        if self._isInfoTabVisible():
+            # Entering Info should show the current connection count immediately;
+            # disabling auto-refresh affects only subsequent periodic requests.
+            self.refreshAccountInfo()
+
+    def refreshAccountInfo(self):
+        """Refresh account metadata without downloading provider content."""
+        if self.account_info_refresh_in_progress:
+            return
+        if not self.server or not self.username or not self.password:
+            self.account_info_last_refresh_label.setText("No account selected")
+            return
+
+        self.account_info_refresh_in_progress = True
+        self.refresh_account_info_button.setEnabled(False)
+        self.account_info_last_refresh_label.setText("Refreshing…")
+        worker = AccountInfoWorker(
+            self.server,
+            self.username,
+            self.password,
+            self.current_user_agent
+        )
+        worker.signals.finished.connect(self._accountInfoRefreshFinished)
+        worker.signals.error.connect(self._accountInfoRefreshFailed)
+        # Keep the Python wrapper alive until the QRunnable has emitted its result.
+        self.account_info_worker = worker
+        self.account_info_threadpool.start(worker)
+
+    def _accountInfoRefreshFinished(self, iptv_info):
+        """Display the refreshed metadata and release the request guard."""
+        self.account_info_refresh_in_progress = False
+        self.account_info_worker = None
+        self.refresh_account_info_button.setEnabled(True)
+        self.updateAccountInfo(iptv_info)
+
+    def _accountInfoRefreshFailed(self, error):
+        """Keep existing information visible when a lightweight refresh fails."""
+        self.account_info_refresh_in_progress = False
+        self.account_info_worker = None
+        self.refresh_account_info_button.setEnabled(True)
+        self.account_info_last_refresh_label.setText(
+            f"Refresh failed at {datetime.now().strftime('%H:%M:%S')}"
+        )
+        print(f"Failed refreshing account information: {error}")
+
+    def updateAccountInfo(self, iptv_info):
+        """Render account and server metadata returned by player_api.php."""
+        user_info = iptv_info.get("user_info", {})
+        server_info = iptv_info.get("server_info", {})
+
+        hostname = server_info.get("url", "Unknown")
+        port = server_info.get("port", "Unknown")
+        host = (
+            "Unknown"
+            if hostname == "Unknown" or port == "Unknown"
+            else f"http://{hostname}:{port}"
+        )
+
+        def format_timestamp(value):
+            """Format optional provider timestamps without breaking the Info tab."""
+            try:
+                return datetime.fromtimestamp(int(value)).strftime("%B %d, %Y")
+            except (TypeError, ValueError, OSError, OverflowError):
+                return "Unknown"
+
+        expiry = format_timestamp(user_info.get("exp_date"))
+        created_at = format_timestamp(user_info.get("created_at"))
+        trial = "Yes" if user_info.get("is_trial") == "1" else "No"
+
+        self.iptv_info_text.setText(
+            f"Host: {host}\n"
+            f"Username: {user_info.get('username', 'Unknown')}\n"
+            f"Password: {user_info.get('password', 'Unknown')}\n"
+            f"Max Connections: {user_info.get('max_connections', 'Unknown')}\n"
+            f"Active Connections: {user_info.get('active_cons', 'Unknown')}\n"
+            f"Timezone: {server_info.get('timezone', 'Unknown')}\n"
+            f"Trial: {trial}\n"
+            f"Status: {user_info.get('status', 'Unknown')}\n"
+            f"Created At: {created_at}\n"
+            f"Expiry: {expiry}\n"
+        )
+        self.account_info_last_refresh_label.setText(
+            f"Last refreshed: {datetime.now().strftime('%H:%M:%S')}"
+        )
+        self._updateAccountInfoTimer()
+
     def process_data(self, iptv_info, categories_per_stream_type, entries_per_stream_type):
         print("Going to process IPTV data now")
 
         self.categories_per_stream_type = categories_per_stream_type
         self.entries_per_stream_type    = entries_per_stream_type
 
+        # A refreshed provider snapshot invalidates every prepared category view.
+        for stream_cache in self.category_view_cache.values():
+            stream_cache.clear()
+        for item_cache in self.category_item_cache.values():
+            item_cache.clear()
+        for stream_type in self.active_category_view_key:
+            self.active_category_view_key[stream_type] = None
+
         self.set_progress_bar(0, "Processing received data...")
 
-        #Process IPTV info
-        user_info   = iptv_info.get("user_info", {})
-        server_info = iptv_info.get("server_info", {})
-
-        hostname    = server_info.get("url", "Unknown")
-        port        = server_info.get("port", "Unknown")
-        if hostname == "Unknown" or port == "Unknown":
-            host = "Unknown"
-        else:
-            host = f"http://{hostname}:{port}"
-
-        username                = user_info.get("username", "Unknown")
-        password                = user_info.get("password", "Unknown")
-        max_connections         = user_info.get("max_connections", "Unknown")
-        active_connections      = user_info.get("active_cons", "Unknown")
-        status                  = user_info.get("status", "Unknown")
-        expire_timestamp        = user_info.get("exp_date", 0)
-        created_at_timestamp    = user_info.get("created_at", 0)
-
-        #If a value is given
-        if expire_timestamp:
-            #Convert date time variable to string
-            expiry = datetime.fromtimestamp(int(expire_timestamp)).strftime("%B %d, %Y")
-        else:
-            expiry = "Unknown"
-
-        #If a value is given
-        if created_at_timestamp:
-            #Convert date time variable to string
-            created_at = datetime.fromtimestamp(int(created_at_timestamp)).strftime("%B %d, %Y")
-        else:
-            created_at = "Unknown"
-
-        if user_info.get("is_trial") == "1":
-            trial = "Yes"
-        else:
-            trial = "No"
-
-        timezone = server_info.get("timezone", "Unknown")
-
-        formatted_data = (
-            f"Host: {host}\n"
-            f"Username: {username}\n"
-            f"Password: {password}\n"
-            f"Max Connections: {max_connections}\n"
-            f"Active Connections: {active_connections}\n"
-            f"Timezone: {timezone}\n"
-            f"Trial: {trial}\n"
-            f"Status: {status}\n"
-            f"Created At: {created_at}\n"
-            f"Expiry: {expiry}\n"
-        )
-
-        #Set formatted data to iptv info tab
-        self.iptv_info_text.setText(formatted_data)
-        QtWidgets.qApp.processEvents()
+        # A cache hit deliberately skips the account request. Keep the initial Info
+        # state until that tab performs its existing lightweight refresh.
+        if iptv_info:
+            self.updateAccountInfo(iptv_info)
 
         #Process categories and entries
+        hidden_categories_changed = False
         for stream_type in self.entries_per_stream_type.keys():
             #Clear category and streaming list
             self.category_list_widgets[stream_type].clear()
             self.streaming_list_widgets[stream_type].clear()
 
-            #Skip VODs if option enabled
-            if self.vods_enabled is False and (stream_type == 'Movies' or stream_type == 'Series'):
+            # A reload replaces the previous snapshot. Clearing these search sources
+            # prevents duplicate and stale results after a content type is re-enabled.
+            self.currently_loaded_streams[stream_type] = []
+            self.currently_loaded_categories[stream_type] = []
+
+            # Disabled types contain no newly requested data and stay out of the UI.
+            if not self.content_enabled[stream_type]:
                 continue
 
             #Fill currently loaded streams with current stream data
-            for entry in self.entries_per_stream_type[stream_type]:
+            for entry in self._entries_in_visible_categories(stream_type):
                 self.currently_loaded_streams[stream_type].append(entry)
 
-            #Fill currently loaded categories with current category data
-            for entry in self.categories_per_stream_type[stream_type]:
+            # Remove exclusions for categories the current provider no longer sends.
+            # This keeps userdata.ini compact without affecting disabled content types.
+            provider_category_ids = {
+                str(category.get('category_id', ''))
+                for category in self.categories_per_stream_type[stream_type]
+            }
+            valid_hidden_ids = (
+                self.hidden_category_ids[stream_type] & provider_category_ids
+            )
+            if valid_hidden_ids != self.hidden_category_ids[stream_type]:
+                self.hidden_category_ids[stream_type] = valid_hidden_ids
+                hidden_categories_changed = True
+
+            # Fill the search source and visible list with non-hidden categories only.
+            visible_categories = self._visible_categories(stream_type)
+            for entry in visible_categories:
                 self.currently_loaded_categories[stream_type].append(entry)
 
             #Add categories in category list
-            num_of_categories = len(self.categories_per_stream_type[stream_type])
+            num_of_categories = len(visible_categories)
             prev_perc = 0
-            for idx, category_item in enumerate(self.categories_per_stream_type[stream_type]):
+            for idx, category_item in enumerate(visible_categories):
                 item = QListWidgetItem(category_item['category_name'])
                 item.setData(Qt.UserRole, category_item)
                 # item.setIcon(channel_icon)
@@ -1662,40 +3446,45 @@ class IPTVPlayerApp(QMainWindow):
                 #Add item to list
                 self.category_list_widgets[stream_type].addItem(item)
 
-                perc = (idx * 100) / num_of_categories
+                perc = (idx * 100) / max(1, num_of_categories)
                 if (perc - prev_perc) > 10:
                     prev_perc = perc
                     self.set_progress_bar(int(perc), f"Loading {stream_type} categories: {idx} of {num_of_categories}")
                     QtWidgets.qApp.processEvents()
 
-            #Sort category list
-            self.sortList(self.category_search_bars[stream_type], 'category', stream_type, self.category_list_widgets, self.sorting_enabled, self.sorting_order)
+            # Sort each first column with its remembered order when that mode is active.
+            category_list_enabled, category_list_order = (
+                self._sorting_for_category_list(stream_type)
+            )
+            self.sortList(
+                self.category_search_bars[stream_type], 'category', stream_type,
+                self.category_list_widgets, category_list_enabled,
+                category_list_order
+            )
 
-            #Add streams in streaming list
-            num_of_entries = len(self.entries_per_stream_type[stream_type])
-            prev_perc = 0
-            for idx, entry in enumerate(self.entries_per_stream_type[stream_type]):
-                item = QListWidgetItem(entry['name'])
-                item.setData(Qt.UserRole, entry)
-                # item.setIcon(channel_icon)
+            # Build the stream list once in its final order. sortList() uses chunked
+            # insertion for top-level catalogs so large Movie libraries do not block
+            # the main window while Qt creates their rows.
+            enabled, order = self._sorting_for_category(
+                stream_type, self.all_categories_text
+            )
+            self.sortList(
+                self.streaming_search_bars[stream_type], 'streaming',
+                stream_type, self.streaming_list_widgets, enabled, order
+            )
+            self.active_category_view_key[stream_type] = self._category_view_key(
+                stream_type, self.all_categories_text
+            )
 
-                self.streaming_list_widgets[stream_type].addItem(item)
-
-                perc = (idx * 100) / num_of_entries
-                if (perc - prev_perc) > 10:
-                    prev_perc = perc
-                    self.set_progress_bar(int(perc), f"Loading {stream_type} streams: {idx} of {num_of_entries}")
-                    QtWidgets.qApp.processEvents()
-
-            #Sort streaming list
-            self.sortList(self.streaming_search_bars[stream_type], 'streaming', stream_type, self.streaming_list_widgets, self.sorting_enabled, self.sorting_order)
+        if hidden_categories_changed:
+            self._save_hidden_categories()
 
         self.set_progress_bar(100, f"Finished loading")
         QtWidgets.qApp.processEvents()
 
     def on_fetch_data_error(self, error_msg):
         print(f"Error occurred while fetching data: {error_msg}")
-        self.set_progress_bar(100, "Failed fetching data")
+        self.set_progress_bar(100, "Failed fetching data", "error")
 
     def show_error_msg(self, title, msg):
         QMessageBox.warning(self, title, msg)
@@ -1772,7 +3561,7 @@ class IPTVPlayerApp(QMainWindow):
         #Update progress bar
         if not vod_info:
             print(f"VOD info was empty: {vod_info}")
-            self.set_progress_bar(100, "Failed loading Movie info")
+            self.set_progress_bar(100, "Failed loading Movie info", "error")
         else:
             self.set_progress_bar(100, "Loaded Movie info")
 
@@ -1785,7 +3574,7 @@ class IPTVPlayerApp(QMainWindow):
     def process_series_info(self, series_info_data, is_show_request):
         #If no series info data available
         if not series_info_data:
-            self.animate_progress(0, 100, "Failed fetching series info")
+            self.animate_progress(0, 100, "Failed fetching series info", "error")
             return
 
         #Check if fetch request came from show_seasons()
@@ -1902,7 +3691,7 @@ class IPTVPlayerApp(QMainWindow):
             #Update progress bar
             if not series_info:
                 # print(f"Series info was empty: {series_info}")
-                self.set_progress_bar(100, "Failed loading Series info")
+                self.set_progress_bar(100, "Failed loading Series info", "error")
             else:
                 self.set_progress_bar(100, "Loaded Series info")
 
@@ -2003,8 +3792,26 @@ class IPTVPlayerApp(QMainWindow):
             with open(self.favorites_file, 'w') as fav_file:
                 json.dump(fav_data, fav_file, indent=4)
 
+            # Only the Favorites view changes here. Other cached category lists keep
+            # references to the same entry dictionaries and remain valid.
+            stream_cache = self.category_view_cache.get(stream_type, {})
+            favorite_keys = [key for key in stream_cache if key[0] == 'favorites']
+            for key in favorite_keys:
+                stream_cache.pop(key, None)
+
+            item_cache = self.category_item_cache.get(stream_type, {})
+            favorite_item_keys = [key for key in item_cache if key[0] == 'favorites']
+            for key in favorite_item_keys:
+                item_cache.pop(key, None)
+
+            # A Favorites view currently attached to the widget is also stale. Mark
+            # it as non-cacheable so switching away does not preserve the old rows.
+            active_key = self.active_category_view_key.get(stream_type)
+            if active_key and active_key[0] == 'favorites':
+                self.active_category_view_key[stream_type] = None
+
         except Exception as e:
-            self.animate_progress(0, 100, "Failed adding to favorites")
+            self.animate_progress(0, 100, "Failed adding to favorites", "error")
 
             print(f"Failed adding to favorites: {e}")
 
@@ -2034,6 +3841,50 @@ class IPTVPlayerApp(QMainWindow):
         # any ids that no longer exist in the catalog (e.g. removed by the provider).
         by_id = {e.get(id_field): e for e in entries}
         return [by_id[i] for i in ordered_ids if i in by_id]
+
+    def _category_view_key(self, stream_type, category_name, category_id=None):
+        """Build the cache key shared by prepared entries and Qt list items."""
+        sorting_enabled, sort_order = self._sorting_for_category(
+            stream_type, category_name, category_id
+        )
+        preference_key = self._category_sort_preference_key(
+            category_name, category_id
+        )
+        return (preference_key, sorting_enabled, sort_order)
+
+    def _entries_for_category_view(self, stream_type, category_name, category_id=None):
+        """Return a cached entry order for one top-level category selection."""
+        is_favorites = category_name == self.fav_categories_text
+        cache_key = self._category_view_key(
+            stream_type, category_name, category_id
+        )
+
+        stream_cache = self.category_view_cache[stream_type]
+        cached_entries = stream_cache.get(cache_key)
+        if cached_entries is not None:
+            return cached_entries
+
+        if is_favorites:
+            prepared_entries = self._favorites_in_user_order(stream_type)
+        elif category_name == self.all_categories_text:
+            prepared_entries = self._entries_in_visible_categories(stream_type)
+        else:
+            prepared_entries = [
+                entry for entry in self.entries_per_stream_type[stream_type]
+                if entry.get('category_id') == category_id
+            ]
+
+        sorting_enabled, sort_order = self._sorting_for_category(
+            stream_type, category_name, category_id
+        )
+        if sorting_enabled:
+            prepared_entries.sort(
+                key=lambda entry: entry.get('name', '').casefold(),
+                reverse=(sort_order == 1)
+            )
+
+        stream_cache[cache_key] = prepared_entries
+        return prepared_entries
 
     def category_item_clicked(self, clicked_item):
         try:
@@ -2067,57 +3918,85 @@ class IPTVPlayerApp(QMainWindow):
 
             self.set_progress_bar(0, "Loading items")
 
+            was_nested_series_view = (
+                stream_type == 'Series' and self.series_navigation_level != 0
+            )
             if stream_type == 'Series':
-                #Reset navigation level
+                # A category selection always starts at the series-list root.
                 self.series_navigation_level = 0
-
-            #Clear items in list
-            self.streaming_list_widgets[stream_type].clear()
-            self.currently_loaded_streams[stream_type].clear()
-
-            #Reset scrollbar position to top
-            self.streaming_list_widgets[stream_type].scrollToTop()
+                self.prev_double_clicked_streaming_item = 0
 
             is_favorites_view = (selected_item_text == self.fav_categories_text)
 
-            # For the Favorites view, walk the favorites.json id list so items
-            # appear in the order the user marked them — not alphabetically and not
-            # in the order the provider returned the catalog (issue #17).
-            if is_favorites_view:
-                ordered_entries = self._favorites_in_user_order(stream_type)
-                for entry in ordered_entries:
-                    item = QListWidgetItem(entry['name'])
-                    item.setData(Qt.UserRole, entry)
-                    self.currently_loaded_streams[stream_type].append(entry)
-                    self.streaming_list_widgets[stream_type].addItem(item)
-            else:
-                for entry in self.entries_per_stream_type[stream_type]:
-                    if selected_item_text == self.all_categories_text:
-                        item = QListWidgetItem(entry['name'])
-                        item.setData(Qt.UserRole, entry)
+            prepared_entries = self._entries_for_category_view(
+                stream_type,
+                selected_item_text,
+                None if is_favorites_view or selected_item_text == self.all_categories_text else category_id
+            )
+            self.currently_loaded_streams[stream_type] = list(prepared_entries)
 
-                        self.currently_loaded_streams[stream_type].append(entry)
-                        self.streaming_list_widgets[stream_type].addItem(item)
+            list_widget = self.streaming_list_widgets[stream_type]
+            target_view_key = self._category_view_key(
+                stream_type, selected_item_text,
+                None if is_favorites_view or selected_item_text == self.all_categories_text else category_id
+            )
+            # The list now represents a different category. Update the search bar's
+            # visual sorting state as well, otherwise its menu keeps the last action
+            # clicked in the previous category even though the new order is correct.
+            self.streaming_search_bars[stream_type].current_sorting = (
+                target_view_key[1], target_view_key[2]
+            )
+            list_widget.setSortingEnabled(False)
+            list_widget.setUpdatesEnabled(False)
+            try:
+                active_view_key = self.active_category_view_key.get(stream_type)
+                search_is_empty = not self.streaming_search_bars[stream_type].text()
+                if (
+                    active_view_key is not None
+                    and search_is_empty
+                    and not was_nested_series_view
+                ):
+                    # Detach from the end so row removal stays O(n), then restore the
+                    # original order before storing the reusable item objects.
+                    detached_items = [
+                        list_widget.takeItem(row)
+                        for row in range(list_widget.count() - 1, -1, -1)
+                    ]
+                    detached_items.reverse()
+                    self.category_item_cache[stream_type][active_view_key] = detached_items
+                else:
+                    # Search results and nested Series rows must never replace a
+                    # complete cached category root view.
+                    list_widget.clear()
 
-                    elif entry.get('category_id') == category_id:
-                        item = QListWidgetItem(entry['name'])
-                        item.setData(Qt.UserRole, entry)
+                cached_items = self.category_item_cache[stream_type].pop(
+                    target_view_key, None
+                )
+                if cached_items is not None:
+                    for item in cached_items:
+                        list_widget.addItem(item)
+                else:
+                    # Let Qt create all text rows in one native batch. Assigning the
+                    # dictionaries afterwards retains the existing click handlers.
+                    list_widget.addItems([
+                        entry.get('name', '') for entry in prepared_entries
+                    ])
+                    for row, entry in enumerate(prepared_entries):
+                        list_widget.item(row).setData(Qt.UserRole, entry)
 
-                        self.currently_loaded_streams[stream_type].append(entry)
-                        self.streaming_list_widgets[stream_type].addItem(item)
+                    if not prepared_entries:
+                        list_widget.addItem("No items in list...")
+
+                self.active_category_view_key[stream_type] = target_view_key
+            finally:
+                list_widget.setUpdatesEnabled(True)
+                list_widget.viewport().update()
+
+            # Reset the viewport only after the batch has been installed.
+            list_widget.scrollToTop()
 
             #Check if list is empty after process
-            if self.streaming_list_widgets[stream_type].count() == 0:
-                #Add list is empty text
-                item = QListWidgetItem("No items in list...")
-
-                self.streaming_list_widgets[stream_type].addItem(item)
-            elif not is_favorites_view:
-                #Sort list — but never re-sort the Favorites list, since that would
-                #destroy the user's add-order (issue #17).
-                self.sortList(self.streaming_search_bars[stream_type], 'streaming', stream_type, self.streaming_list_widgets, self.sorting_enabled, self.sorting_order)
-
-            self.animate_progress(0, 100, "Loading finished")
+            self.set_progress_bar(100, "Loading finished")
 
         except Exception as e:
             print(f"Failed: {e}")
@@ -2137,7 +4016,9 @@ class IPTVPlayerApp(QMainWindow):
         print(f"Failed processing streaming status: {error_msg}")
 
         #Set stream status to unknown
-        self.live_info_box.stream_status.setPixmap(QPixmap(self.path_to_unknown_status_icon).scaledToWidth(24))
+        self.live_info_box.stream_status.setPixmap(
+            self.statusPixmap(self.path_to_unknown_status_icon, 24)
+        )
 
     def ProcessStreamStatus(self, stream_id, stream_status):
         try:
@@ -2147,11 +4028,17 @@ class IPTVPlayerApp(QMainWindow):
                 return
 
             if (stream_status == "True"):
-                self.live_info_box.stream_status.setPixmap(QPixmap(self.path_to_online_status_icon).scaledToWidth(24))
+                self.live_info_box.stream_status.setPixmap(
+                    self.statusPixmap(self.path_to_online_status_icon, 24)
+                )
             elif (stream_status == "Maybe"):
-                self.live_info_box.stream_status.setPixmap(QPixmap(self.path_to_maybe_status_icon).scaledToWidth(24))
+                self.live_info_box.stream_status.setPixmap(
+                    self.statusPixmap(self.path_to_maybe_status_icon, 24)
+                )
             else:
-                self.live_info_box.stream_status.setPixmap(QPixmap(self.path_to_offline_status_icon).scaledToWidth(24))
+                self.live_info_box.stream_status.setPixmap(
+                    self.statusPixmap(self.path_to_offline_status_icon, 24)
+                )
         except Exception as e:
             print(f"Failed processing streaming status: {e}")
 
@@ -2168,7 +4055,7 @@ class IPTVPlayerApp(QMainWindow):
 
     def onEPGFetchError(self, error_msg):
         print(f"Failed fetching EPG data: {error_msg}")
-        self.set_progress_bar(100, "Failed loading EPG data")
+        self.set_progress_bar(100, "Failed loading EPG data", "error")
 
         #Set list view
         item = QTreeWidgetItem(["--/--/----", "--:--", "--:--", "Failed loading EPG data..."])
@@ -2237,6 +4124,7 @@ class IPTVPlayerApp(QMainWindow):
 
         except Exception as e:
             print(f"Failed processing EPG: {e}")
+            self.set_progress_bar(100, "Failed processing EPG data", "error")
 
     def streaming_item_clicked(self, clicked_item):
         try:
@@ -2285,7 +4173,9 @@ class IPTVPlayerApp(QMainWindow):
                 self.live_info_box.EPG_box_label.setText(f"{clicked_item_data['name']}")
 
                 #Clear Stream Status indicator
-                self.live_info_box.stream_status.setPixmap(QPixmap(self.path_to_unknown_status_icon).scaledToWidth(25))
+                self.live_info_box.stream_status.setPixmap(
+                    self.statusPixmap(self.path_to_unknown_status_icon, 25)
+                )
 
                 #Clear EPG data
                 self.live_info_box.live_EPG_info.clear()
@@ -2437,6 +4327,11 @@ class IPTVPlayerApp(QMainWindow):
         except Exception as e:
             print(f"failed item double click: {e}")
 
+    def streaming_item_keyboard_activated(self, item):
+        """Apply the normal selection work, then open or play the chosen entry."""
+        self.streaming_item_clicked(item)
+        self.streaming_item_double_clicked(item)
+
     def go_back_to_level(self, series_navigation_level):
         self.set_progress_bar(0, "Loading items")
 
@@ -2539,7 +4434,7 @@ class IPTVPlayerApp(QMainWindow):
 
     def play_item(self, url):
         if not url:
-            self.animate_progress(0, 100, "Stream URL not found")
+            self.animate_progress(0, 100, "Stream URL not found", "error")
 
             #Create warning message box to indicate error
             error_dialog = QMessageBox()
@@ -2556,7 +4451,7 @@ class IPTVPlayerApp(QMainWindow):
 
         if self.external_player_command:
             try:
-                print(f"Going to play: {url}")
+                print(f"Going to play: {private_url_log_reference(url)}")
                 self.animate_progress(0, 100, "Loading player for streaming")
 
                 # Embedded VLC marker — short-circuit before constructing any subprocess
@@ -2572,7 +4467,7 @@ class IPTVPlayerApp(QMainWindow):
                 if is_linux:
                     #Ensure the external player command is executable
                     if not os.access(self.external_player_command, os.X_OK):
-                        self.animate_progress(0, 100, "Selected player is not executable")
+                        self.animate_progress(0, 100, "Selected player is not executable", "error")
                         return
 
                     # Linux: list-form Popen is safe (no shell quirks); each player
@@ -2613,13 +4508,28 @@ class IPTVPlayerApp(QMainWindow):
 
                     subprocess.Popen(player_cmd)
 
+                elif is_mac:
+                    # Finder exposes applications as .app bundles, but subprocess
+                    # must launch the executable declared inside the bundle.
+                    player_executable = self.external_player_command
+                    if player_executable.lower().endswith(".app") and path.isdir(player_executable):
+                        player_executable = macos_bundle_executable(player_executable)
+                    player_cmd = [player_executable]
+                    if path.basename(player_executable).lower() == "vlc" and ua:
+                        player_cmd.append(f"--http-user-agent={ua}")
+                    player_cmd.append(url)
+                    subprocess.Popen(player_cmd)
+
                 else:
                     subprocess.Popen([self.external_player_command, url])
 
             except Exception as e:
                 import traceback
-                self.animate_progress(0, 100, "Failed playing stream")
-                print(f"Failed playing stream [{url}]: {e}")
+                self.animate_progress(0, 100, "Failed playing stream", "error")
+                print(
+                    "Failed playing stream "
+                    f"[{private_url_log_reference(url)}]: {e}"
+                )
                 traceback.print_exc()
                 try:
                     error_dialog = QMessageBox(self)
@@ -2629,13 +4539,15 @@ class IPTVPlayerApp(QMainWindow):
                         f"Could not launch the external player.\n\n"
                         f"Player: {self.external_player_command}\n"
                         f"Error: {e}\n\n"
-                        f"See log.txt for the full traceback."
+                        f"See {path.join(writable_data_directory(), 'log.txt')} "
+                        f"for the full traceback."
                     )
                     error_dialog.setStandardButtons(QMessageBox.Ok)
                     error_dialog.exec_()
                 except Exception:
                     pass
         else:
+            self.set_progress_bar(100, "No media player configured", "error")
             #Create warning message box to indicate error
             error_dialog = QMessageBox()
             error_dialog.setIcon(QMessageBox.Warning)
@@ -2665,27 +4577,55 @@ class IPTVPlayerApp(QMainWindow):
 
             if len(file_paths) > 0:
                 self.external_player_command = file_paths[0]
+                self.last_external_player_command = self.external_player_command
 
                 self.save_external_player_command()
                 self._refresh_current_player_label()
 
                 self.animate_progress(0, 100, "Selected external media player")
+                return True
+
+        # Keep the previously active mode when the file dialog is cancelled.
+        self._refresh_current_player_label()
+        return False
+
+    def use_external_player(self, checked):
+        """Activate the remembered external player or ask for one when absent."""
+        if not checked:
+            return
+
+        remembered_command = getattr(self, "last_external_player_command", "") or ""
+        if remembered_command:
+            self.external_player_command = remembered_command
+            self.save_external_player_command()
+            self._refresh_current_player_label()
+            self.animate_progress(0, 100, "External media player enabled")
+            return
+
+        # Selecting External player without a remembered executable immediately opens
+        # the chooser. Cancelling restores the mode represented by the active command.
+        self.choose_external_player()
 
     def use_embedded_player(self):
         # User clicked "Use Internal Player (VLC)". Check libvlc is reachable BEFORE
         # we persist the choice — otherwise the user gets a silent failure later
         # when they try to play something.
         if not EmbeddedPlayerWindow.is_available():
+            self.set_progress_bar(100, "Internal VLC player unavailable", "error")
             error_dialog = QMessageBox(self)
             error_dialog.setIcon(QMessageBox.Warning)
-            error_dialog.setWindowTitle("Embedded player unavailable")
+            error_dialog.setWindowTitle("Internal VLC unavailable")
             error_dialog.setText(
-                "The internal VLC player needs libvlc installed on this machine.\n\n"
-                "Install VLC from https://www.videolan.org/vlc/ and then click this button again.\n"
-                "(After installing, you may also need: pip install python-vlc)"
+                "The internal player uses VLC installed on this computer, but a "
+                "compatible VLC installation could not be found.\n\n"
+                "Install the latest VLC version from https://www.videolan.org/vlc/, "
+                "restart this application, and try again.\n\n"
+                "Alternatively, select External player and choose another installed "
+                "media player."
             )
             error_dialog.setStandardButtons(QMessageBox.Ok)
             error_dialog.exec_()
+            self._refresh_current_player_label()
             return
 
         self.external_player_command = "<embedded-vlc>"
@@ -2697,43 +4637,163 @@ class IPTVPlayerApp(QMainWindow):
         if not hasattr(self, "current_player_label"):
             return
         cmd = getattr(self, "external_player_command", "") or ""
+
+        # Updating the radio buttons from persisted state must not trigger their
+        # activation handlers and reopen the external-player chooser at startup.
+        self.internal_player_radio.blockSignals(True)
+        self.external_player_radio.blockSignals(True)
         if cmd == "<embedded-vlc>":
-            self.current_player_label.setText("Active player: Internal VLC (embedded)")
+            self.current_player_label.setText(
+                "Active player: Internal VLC (using the installed VLC engine)"
+            )
+            self.internal_player_radio.setChecked(True)
+            self.external_player_radio.setChecked(False)
         elif cmd:
             self.current_player_label.setText(f"Active player: {cmd}")
+            self.internal_player_radio.setChecked(False)
+            self.external_player_radio.setChecked(True)
         else:
-            self.current_player_label.setText("No player selected — choose one above.")
+            self.current_player_label.setText("No player selected")
+            self.internal_player_radio.setChecked(False)
+            self.external_player_radio.setChecked(False)
+        self.internal_player_radio.blockSignals(False)
+        self.external_player_radio.blockSignals(False)
+
+        remembered_command = getattr(self, "last_external_player_command", "") or ""
+        self.external_player_path.setText(remembered_command)
+        external_mode = self.external_player_radio.isChecked()
+        self.external_player_path.setEnabled(external_mode)
+        self.choose_player_button.setEnabled(external_mode)
+        self.internal_player_settings_button.setEnabled(
+            self.internal_player_radio.isChecked()
+        )
 
     def _play_embedded(self, url):
-        # Lazily create the embedded VLC window — keeping a single instance lets
-        # the user switch channels without rebuilding the libvlc context each time.
-        if not hasattr(self, "_embedded_player_window") or self._embedded_player_window is None:
-            try:
-                self._embedded_player_window = EmbeddedPlayerWindow(self, user_agent=self.current_user_agent)
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                error_dialog = QMessageBox(self)
-                error_dialog.setIcon(QMessageBox.Critical)
-                error_dialog.setWindowTitle("Embedded player error")
-                error_dialog.setText(
-                    f"Could not start the internal VLC player:\n{e}\n\n"
-                    "Install VLC from https://www.videolan.org/vlc/ and try again."
-                )
-                error_dialog.exec_()
-                return
-
         try:
             playlist, current_idx, title = self._collect_visible_playlist(url)
-            self._embedded_player_window.play_url(
-                url, title=title, playlist=playlist, index=current_idx,
-            )
+            self._ensureEmbeddedPlayerProcess()
+            self._embedded_player_command_queue.put({
+                'command': 'play',
+                'url': url,
+                'title': title,
+                'playlist': playlist,
+                'index': current_idx
+            })
             self.animate_progress(0, 100, "Playing in internal player")
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self.animate_progress(0, 100, "Failed playing stream")
-            print(f"Embedded play failed [{url}]: {e}")
+            self.animate_progress(0, 100, "Failed playing stream", "error")
+            print(
+                "Embedded play failed "
+                f"[{private_url_log_reference(url)}]: {e}"
+            )
+
+    def _ensureEmbeddedPlayerProcess(self):
+        """Start the isolated player process and its private command channel."""
+        if (
+            self._embedded_player_process is not None
+            and self._embedded_player_process.poll() is None
+            and self._embedded_player_command_queue is not None
+        ):
+            return
+
+        self._closeEmbeddedPlayerListener()
+        auth_key = os.urandom(32)
+        if is_windows:
+            family = 'AF_PIPE'
+            address = rf'\\.\pipe\iptv-player-{uuid.uuid4().hex}'
+        else:
+            import tempfile
+            family = 'AF_UNIX'
+            address = path.join(
+                tempfile.gettempdir(), f'iptv-player-{uuid.uuid4().hex}.sock'
+            )
+
+        listener = Listener(address=address, family=family, authkey=auth_key)
+        environment = os.environ.copy()
+        environment['IPTV_PLAYER_IPC_ADDRESS'] = address
+        environment['IPTV_PLAYER_IPC_FAMILY'] = family
+        environment['IPTV_PLAYER_IPC_AUTH'] = auth_key.hex()
+        environment['IPTV_PLAYER_USER_AGENT'] = self.current_user_agent or ''
+        environment['IPTV_PLAYER_THEME'] = self.theme_select_box.currentText()
+        environment['IPTV_PLAYER_SEEK_STEP'] = str(self.internal_seek_step_seconds)
+        environment['IPTV_PLAYER_VOLUME_STEP'] = str(self.internal_volume_step_percent)
+        environment['IPTV_PLAYER_SPEED_STEP'] = str(self.internal_speed_step)
+        environment['IPTV_PLAYER_AUDIO_LANGUAGE'] = self.internal_audio_language
+        environment['IPTV_PLAYER_SUBTITLE_LANGUAGE'] = self.internal_subtitle_language
+        environment['IPTV_PLAYER_SETTINGS_FILE'] = path.abspath(self.user_data_file)
+
+        if getattr(sys, 'frozen', False):
+            # Tell recent PyInstaller bootloaders that this is a new application
+            # instance, rather than one of their own internal worker processes.
+            environment['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+            command = [sys.executable, '--embedded-player-process']
+        else:
+            command = [sys.executable, path.abspath(__file__), '--embedded-player-process']
+
+        creation_flags = subprocess.CREATE_NO_WINDOW if is_windows else 0
+        try:
+            process = subprocess.Popen(
+                command,
+                env=environment,
+                creationflags=creation_flags
+            )
+        except Exception:
+            listener.close()
+            raise
+
+        command_queue = queue.Queue()
+        self._embedded_player_process = process
+        self._embedded_player_listener = listener
+        self._embedded_player_command_queue = command_queue
+
+        def send_commands():
+            connection = None
+            try:
+                connection = listener.accept()
+                while True:
+                    payload = command_queue.get()
+                    if payload is None:
+                        break
+                    connection.send(payload)
+            except (EOFError, OSError, BrokenPipeError) as error:
+                print(f"Internal player command channel closed: {error}")
+            finally:
+                if connection is not None:
+                    connection.close()
+                listener.close()
+
+        self._embedded_player_sender_thread = threading.Thread(
+            target=send_commands,
+            name='EmbeddedPlayerCommandSender',
+            daemon=True
+        )
+        self._embedded_player_sender_thread.start()
+
+    def _closeEmbeddedPlayerListener(self):
+        """Close resources left by an earlier isolated player instance."""
+        if self._embedded_player_listener is not None:
+            try:
+                self._embedded_player_listener.close()
+            except OSError:
+                pass
+        self._embedded_player_listener = None
+        self._embedded_player_command_queue = None
+
+    def _stopEmbeddedPlayerProcess(self):
+        """Stop the isolated player when the main application exits."""
+        if self._embedded_player_command_queue is not None:
+            self._embedded_player_command_queue.put({'command': 'quit'})
+            self._embedded_player_command_queue.put(None)
+        process = self._embedded_player_process
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+        self._embedded_player_process = None
+        self._closeEmbeddedPlayerListener()
 
     def _collect_visible_playlist(self, url):
         # Build the player's sidebar list from what's CURRENTLY VISIBLE in the main
@@ -2854,47 +4914,58 @@ class IPTVPlayerApp(QMainWindow):
     def search_in_list(self, list_content_type, stream_type, text):
         try:
             self.set_progress_bar(0, f"Loading search results...")
+            # Every normalized query word must occur somewhere in the candidate.
+            # Substring matching intentionally allows partial words without adding
+            # fuzzy-search complexity or unpredictable similarity thresholds.
+            search_terms = normalize_search_text(text).split()
 
             #If searching in category list
             if list_content_type == 'category':
-                #Check if list is empty
-                if not self.currently_loaded_categories[stream_type]:
-                    return
+                list_widget = self.category_list_widgets[stream_type]
+                matching_entries = [
+                    entry for entry in self.currently_loaded_categories[stream_type]
+                    if title_matches_search(
+                        entry.get('category_name', ''), search_terms
+                    )
+                ]
+                category_list_enabled, category_list_order = (
+                    self._sorting_for_category_list(stream_type)
+                )
+                if category_list_enabled:
+                    matching_entries.sort(
+                        key=lambda entry: entry.get('category_name', '').casefold(),
+                        reverse=(category_list_order == 1)
+                    )
 
-                #Enable or disable sorting
-                self.category_list_widgets[stream_type].setSortingEnabled(self.sorting_enabled)
-
-                #When sorting is enabled, set sort order, 0: A-Z, 1: Z-A
-                if self.sorting_enabled:
-                    self.category_list_widgets[stream_type].sortItems(self.sorting_order)
-
-                self.category_list_widgets[stream_type].clear()
-
-                for entry in self.currently_loaded_categories[stream_type]:
-                    if text.lower() in entry.get('category_name', '').lower():
+                # Build the final order once. Keeping Qt automatic sorting enabled
+                # while inserting thousands of matches causes repeated O(n log n)
+                # work and can make the interface appear frozen.
+                list_widget.setSortingEnabled(False)
+                list_widget.setUpdatesEnabled(False)
+                try:
+                    list_widget.clear()
+                    for entry in matching_entries:
                         item = QListWidgetItem(entry['category_name'])
                         item.setData(Qt.UserRole, entry)
+                        list_widget.addItem(item)
 
-                        self.category_list_widgets[stream_type].addItem(item)
+                    #if search bar is empty
+                    if not search_terms:
+                        # Add 'All' and 'Favorites' categories to top
+                        itemAll = QListWidgetItem(self.all_categories_text)
+                        itemAll.setData(Qt.UserRole, {'category_name': self.all_categories_text})
+                        list_widget.insertItem(0, itemAll)
 
-                #Disable sorting
-                self.category_list_widgets[stream_type].setSortingEnabled(False)
+                        itemFav = QListWidgetItem(self.fav_categories_text)
+                        itemFav.setData(Qt.UserRole, {'category_name': self.fav_categories_text})
+                        list_widget.insertItem(1, itemFav)
 
-                #if search bar is empty
-                if not text:
-                    # Add 'All' and 'Favorites' categories to top
-                    itemAll = QListWidgetItem(self.all_categories_text)
-                    itemAll.setData(Qt.UserRole, {'category_name': self.all_categories_text})
-                    self.category_list_widgets[stream_type].insertItem(0, itemAll)
-
-                    itemFav = QListWidgetItem(self.fav_categories_text)
-                    itemFav.setData(Qt.UserRole, {'category_name': self.fav_categories_text})
-                    self.category_list_widgets[stream_type].insertItem(1, itemFav)
-
-                #Check if no search results found
-                num_of_items = self.category_list_widgets[stream_type].count()
-                if not num_of_items:
-                    self.category_list_widgets[stream_type].addItem("No search results found...")
+                    #Check if no search results found
+                    if not list_widget.count():
+                        list_widget.addItem("No search results found...")
+                finally:
+                    list_widget.setUpdatesEnabled(True)
+                    list_widget.viewport().update()
 
             #If searching in streaming content list
             elif list_content_type == 'streaming':
@@ -2902,53 +4973,82 @@ class IPTVPlayerApp(QMainWindow):
                 if not self.currently_loaded_streams[stream_type]:
                     return
 
-                #Enable or disable sorting
-                self.streaming_list_widgets[stream_type].setSortingEnabled(self.sorting_enabled)
+                list_widget = self.streaming_list_widgets[stream_type]
+                list_widget.setSortingEnabled(False)
+                list_widget.setUpdatesEnabled(False)
+                try:
+                    list_widget.clear()
+                    navigation_level = (
+                        self.series_navigation_level if stream_type == 'Series' else 0
+                    )
 
-                #When sorting is enabled, set sort order, 0: A-Z, 1: Z-A
-                if self.sorting_enabled:
-                    self.streaming_list_widgets[stream_type].sortItems(self.sorting_order)
-
-                self.streaming_list_widgets[stream_type].clear()
-
-                match self.series_navigation_level:
-                    case 0: #LIVE/VOD/Series
-                        for entry in self.currently_loaded_streams[stream_type]:
-                            if text.lower() in entry['name'].lower():
+                    match navigation_level:
+                        case 0: #LIVE/VOD/Series
+                            matching_entries = [
+                                entry for entry in self.currently_loaded_streams[stream_type]
+                                if title_matches_search(
+                                    entry.get('name', ''), search_terms
+                                )
+                            ]
+                            if self.sorting_enabled:
+                                matching_entries.sort(
+                                    key=lambda entry: entry['name'].casefold(),
+                                    reverse=(self.sorting_order == 1)
+                                )
+                            for entry in matching_entries:
                                 item = QListWidgetItem(entry['name'])
                                 item.setData(Qt.UserRole, entry)
+                                list_widget.addItem(item)
+                        case 1: #Seasons
+                            list_widget.addItem(self.go_back_text)
 
-                                self.streaming_list_widgets[stream_type].addItem(item)
-                    case 1: #Seasons
-                        self.streaming_list_widgets[stream_type].addItem(self.go_back_text)
+                            # Sort numerically so "Season 10" follows "Season 9".
+                            def _season_sort_key(k):
+                                try:
+                                    return (0, int(k))
+                                except (TypeError, ValueError):
+                                    return (1, str(k).lower())
 
-                        # Sort numerically so "Season 10" follows "Season 9" (issue #18).
-                        def _season_sort_key(k):
-                            try:
-                                return (0, int(k))
-                            except (TypeError, ValueError):
-                                return (1, str(k).lower())
-
-                        for season in sorted(self.currently_loaded_streams['Seasons'].keys(), key=_season_sort_key):
-                            if text.lower() in f"season {season}".lower():
+                            seasons = [
+                                season for season in self.currently_loaded_streams['Seasons']
+                                if title_matches_search(
+                                    f"season {season}", search_terms
+                                )
+                            ]
+                            if self.sorting_enabled:
+                                seasons.sort(
+                                    key=_season_sort_key,
+                                    reverse=(self.sorting_order == 1)
+                                )
+                            for season in seasons:
                                 item = QListWidgetItem(f"Season {season}")
                                 item.setData(Qt.UserRole, self.currently_loaded_streams['Seasons'][season])
-
-                                self.streaming_list_widgets[stream_type].addItem(item)
-                    case 2: #Episodes
-                        self.streaming_list_widgets[stream_type].addItem(self.go_back_text)
-
-                        for episode in self.currently_loaded_streams['Episodes']:
-                            if text.lower() in episode['title'].lower():
+                                list_widget.addItem(item)
+                        case 2: #Episodes
+                            list_widget.addItem(self.go_back_text)
+                            matching_episodes = [
+                                episode for episode in self.currently_loaded_streams['Episodes']
+                                if title_matches_search(
+                                    episode.get('title', ''), search_terms
+                                )
+                            ]
+                            if self.sorting_enabled:
+                                matching_episodes.sort(
+                                    key=lambda episode: episode['title'].casefold(),
+                                    reverse=(self.sorting_order == 1)
+                                )
+                            for episode in matching_episodes:
                                 item = QListWidgetItem(episode['title'])
                                 item.setData(Qt.UserRole, episode)
+                                list_widget.addItem(item)
 
-                                self.streaming_list_widgets[stream_type].addItem(item)
-
-                #Check if no search results found
-                num_of_items = self.streaming_list_widgets[stream_type].count()
-                if not (num_of_items - (self.series_navigation_level > 0)):
-                    self.streaming_list_widgets[stream_type].addItem("No search results found...")
+                    #Check if no search results found
+                    num_of_items = list_widget.count()
+                    if not (num_of_items - (navigation_level > 0)):
+                        list_widget.addItem("No search results found...")
+                finally:
+                    list_widget.setUpdatesEnabled(True)
+                    list_widget.viewport().update()
 
             self.set_progress_bar(100, f"Loaded search results")
         except Exception as e:
@@ -2962,7 +5062,12 @@ class IPTVPlayerApp(QMainWindow):
             config = configparser.ConfigParser()
 
         if config.has_option('ExternalPlayer', 'Command'):
-            return config['ExternalPlayer'].get('Command', '')
+            command = config['ExternalPlayer'].get('Command', '')
+            remembered_command = config['ExternalPlayer'].get('LastExternalCommand', '')
+            if command and command != "<embedded-vlc>":
+                remembered_command = command
+            self.last_external_player_command = remembered_command
+            return command
 
         # First-run default: prefer the internal libvlc-backed player when it's
         # actually usable on this machine. If libvlc isn't present we leave the
@@ -2973,6 +5078,7 @@ class IPTVPlayerApp(QMainWindow):
                 # Persist the choice so the user can see "Active player: Internal VLC"
                 # in Settings without having to click anything.
                 config['ExternalPlayer'] = {'Command': default_cmd}
+                self.last_external_player_command = ""
                 try:
                     with open(self.user_data_file, 'w') as config_file:
                         config.write(config_file)
@@ -2982,6 +5088,7 @@ class IPTVPlayerApp(QMainWindow):
         except Exception:
             pass
 
+        self.last_external_player_command = ""
         return ""
 
     def save_external_player_command(self):
@@ -2991,7 +5098,15 @@ class IPTVPlayerApp(QMainWindow):
         except (configparser.Error, UnicodeDecodeError):
             config = configparser.ConfigParser()
 
-        config['ExternalPlayer'] = {'Command': self.external_player_command}
+        # Store the active mode and the last external executable separately. Switching
+        # to Internal VLC must not erase the path the user may want to select again.
+        if self.external_player_command and self.external_player_command != "<embedded-vlc>":
+            self.last_external_player_command = self.external_player_command
+        remembered_command = getattr(self, "last_external_player_command", "") or ""
+        config['ExternalPlayer'] = {
+            'Command': self.external_player_command,
+            'LastExternalCommand': remembered_command
+        }
 
         try:
             with open(self.user_data_file, 'w') as config_file:
@@ -3001,15 +5116,25 @@ class IPTVPlayerApp(QMainWindow):
 
     def open_address_book(self):
         dialog = AccountManager(self)
+        self._prepare_dialog_theme(dialog)
         dialog.exec_()
 
 def _install_logging():
-    # Write every print() / unhandled exception to log.txt next to the script.
+    # Write every print() and unhandled exception to a persistent log file.
     # The app used to silently die when an external player launch failed; now the
     # traceback ends up on disk where the user can paste it into a bug report.
     import logging, atexit, traceback as _tb
 
-    log_path = path.join(path.dirname(path.abspath(__file__)), "log.txt")
+    # Frozen Windows and Linux builds keep diagnostics beside the executable.
+    # macOS application bundles are read-only in normal use, so their log shares
+    # the writable Application Support directory with the configuration files.
+    application_dir = writable_data_directory() if is_mac else (
+        path.dirname(path.abspath(sys.executable))
+        if getattr(sys, 'frozen', False)
+        else path.dirname(path.abspath(__file__))
+    )
+    os.makedirs(application_dir, exist_ok=True)
+    log_path = path.join(application_dir, "log.txt")
 
     class _StreamToLogger:
         def __init__(self, original, level):
@@ -3062,21 +5187,142 @@ def _install_logging():
     logging.info("=== Session start (log lives at %s) ===", log_path)
     atexit.register(lambda: logging.info("=== Session end ==="))
 
-def main():
-    _install_logging()
-    app = QApplication(sys.argv)
+
+def _configure_qt_application(app):
+    """Apply the same visual defaults in the main and player processes."""
     app.setStyle('Fusion')
 
-    # Set an application-wide font that has Arabic/CJK glyphs out of the box —
-    # otherwise non-Latin scripts (Arabic, in particular) render as a row of '?'
-    # because Qt picks a font whose glyph table is missing those code points.
+    # Use fonts with broad Unicode coverage so provider titles remain readable.
     if is_windows:
         app.setFont(QFont("Segoe UI", 10))
     elif is_mac:
         app.setFont(QFont("Helvetica Neue", 13))
     else:
-        # Most Linux desktops have Noto Sans (which covers Arabic via Noto Naskh fallback).
         app.setFont(QFont("Noto Sans", 10))
+
+
+def _run_embedded_player_process():
+    """Run the libVLC window separately from the main application process."""
+    address = os.environ.get('IPTV_PLAYER_IPC_ADDRESS', '')
+    family = os.environ.get('IPTV_PLAYER_IPC_FAMILY', '')
+    encoded_auth_key = os.environ.get('IPTV_PLAYER_IPC_AUTH', '')
+    if not address or not family or not encoded_auth_key:
+        return 1
+
+    try:
+        connection = Client(
+            address=address,
+            family=family,
+            authkey=bytes.fromhex(encoded_auth_key)
+        )
+        first_command = connection.recv()
+    except (EOFError, OSError, ValueError):
+        return 1
+
+    # Do not expose the private child-mode argument to Qt's option parser.
+    app = QApplication([sys.argv[0]])
+    _configure_qt_application(app)
+    apply_application_theme(app, os.environ.get('IPTV_PLAYER_THEME', 'System'))
+
+    # Environment values originate from bounded application settings, but parse
+    # defensively so a manually launched child still receives safe defaults.
+    try:
+        seek_step = max(1, min(int(os.environ.get(
+            'IPTV_PLAYER_SEEK_STEP', DEFAULT_INTERNAL_SEEK_STEP_SECONDS
+        )), 300))
+    except ValueError:
+        seek_step = DEFAULT_INTERNAL_SEEK_STEP_SECONDS
+    try:
+        volume_step = max(1, min(int(os.environ.get(
+            'IPTV_PLAYER_VOLUME_STEP', DEFAULT_INTERNAL_VOLUME_STEP_PERCENT
+        )), 25))
+    except ValueError:
+        volume_step = DEFAULT_INTERNAL_VOLUME_STEP_PERCENT
+    try:
+        speed_step = max(0.05, min(float(os.environ.get(
+            'IPTV_PLAYER_SPEED_STEP', DEFAULT_INTERNAL_SPEED_STEP
+        )), 1.0))
+    except ValueError:
+        speed_step = DEFAULT_INTERNAL_SPEED_STEP
+
+    player = EmbeddedPlayerWindow(
+        None,
+        user_agent=os.environ.get('IPTV_PLAYER_USER_AGENT', ''),
+        settings_path=os.environ.get('IPTV_PLAYER_SETTINGS_FILE') or None,
+        seek_step_seconds=seek_step,
+        volume_step_percent=volume_step,
+        speed_step=speed_step,
+        audio_language=os.environ.get('IPTV_PLAYER_AUDIO_LANGUAGE', ''),
+        subtitle_language=os.environ.get('IPTV_PLAYER_SUBTITLE_LANGUAGE', '')
+    )
+    bridge = EmbeddedPlayerCommandBridge()
+
+    def handle_command(payload):
+        if payload.get('command') == 'play':
+            player.play_url(
+                payload.get('url', ''),
+                payload.get('title', ''),
+                payload.get('playlist') or [],
+                payload.get('index', 0)
+            )
+        elif payload.get('command') == 'quit':
+            player.close()
+            app.quit()
+        elif payload.get('command') == 'theme':
+            apply_application_theme(app, payload.get('theme', 'System'))
+            player.apply_theme()
+        elif payload.get('command') == 'control_steps':
+            player.set_control_steps(
+                payload.get('seek_seconds', DEFAULT_INTERNAL_SEEK_STEP_SECONDS),
+                payload.get('volume_percent', DEFAULT_INTERNAL_VOLUME_STEP_PERCENT),
+                payload.get('speed_step', DEFAULT_INTERNAL_SPEED_STEP)
+            )
+            player.set_track_preferences(
+                payload.get('audio_language', ''),
+                payload.get('subtitle_language', '')
+            )
+
+    bridge.command_received.connect(handle_command)
+    bridge.connection_closed.connect(app.quit)
+
+    def receive_commands():
+        try:
+            while True:
+                payload = connection.recv()
+                if not isinstance(payload, dict):
+                    continue
+                bridge.command_received.emit(payload)
+                if payload.get('command') == 'quit':
+                    break
+        except (EOFError, OSError):
+            bridge.connection_closed.emit()
+
+    receiver = threading.Thread(
+        target=receive_commands,
+        name='EmbeddedPlayerCommandReceiver',
+        daemon=True
+    )
+    receiver.start()
+    handle_command(first_command)
+
+    try:
+        return app.exec_()
+    finally:
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+
+def main():
+    # A frozen one-file executable re-enters this module for its player child.
+    # Handle that mode before configuring the main process and its log file.
+    if '--embedded-player-process' in sys.argv:
+        sys.exit(_run_embedded_player_process())
+
+    _install_logging()
+    app = QApplication(sys.argv)
+    _configure_qt_application(app)
 
     player = IPTVPlayerApp()
     player.show()
