@@ -7,6 +7,7 @@ import subprocess
 import configparser
 import re
 import json
+import hashlib
 import html
 from lxml import etree, html
 from datetime import datetime
@@ -39,6 +40,7 @@ DEFAULT_READ_TIMEOUT         = 30
 DEFAULT_LIVE_STATUS_TIMEOUT  = 7
 DEFAULT_LIVE_STATUS_RETRIES  = 2
 DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL = 60
+DEFAULT_CATALOG_CACHE_MAX_AGE_HOURS = 24
 
 # LIVE status retries are additional attempts, so the default value of 2 allows
 # up to 3 probes including the initial request.
@@ -102,7 +104,9 @@ class FetchDataWorkerSignals(QObject):
 
 class FetchDataWorker(QRunnable):
     def __init__(self, server, username, password, live_url_format, movie_url_format,
-                 series_url_format, parent=None, enabled_stream_types=None):
+                 series_url_format, parent=None, enabled_stream_types=None,
+                 catalog_cache_enabled=True, catalog_cache_max_age_hours=24,
+                 force_provider_refresh=False):
         super().__init__()
         self.server            = server
         self.username          = username
@@ -122,7 +126,17 @@ class FetchDataWorker(QRunnable):
             for stream_type in ('LIVE', 'Movies', 'Series')
         }
         self.parent            = parent
+        self.catalog_cache_enabled = bool(catalog_cache_enabled)
+        self.catalog_cache_max_age_hours = max(
+            1, min(int(catalog_cache_max_age_hours), 720)
+        )
+        self.force_provider_refresh = bool(force_provider_refresh)
         self.signals           = FetchDataWorkerSignals()
+
+    def _cache_account_key(self):
+        """Identify a provider account without writing credentials to the cache."""
+        identity = f"{self.server.rstrip('/').casefold()}\0{self.username}"
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
     @pyqtSlot()
     def run(self):
@@ -159,29 +173,20 @@ class FetchDataWorker(QRunnable):
 
             print("Going to fetch IPTV data")
 
-            #Get IPTV info
-            self.signals.progress_bar.emit(0, 5, "Fetching IPTV info")
-            try:
-                iptv_info_resp = requests.get(host_url, params=params, headers=headers, timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT))
-                iptv_info_resp.raise_for_status()
+            iptv_info_data = {}
 
-                iptv_info_data = iptv_info_resp.json()
-            except Exception as e:
-                iptv_info_data = {}
-
-                print(f"failed fetching IPTV data: {e}")
-
-            #Load cached data
+            # Load only cache data belonging to this provider account. Older cache
+            # files have no metadata and are refreshed once before becoming trusted.
             cached_data = {}
-
-            #Check if cache file exists
-            if path.isfile(self.parent.cache_file):
+            if self.catalog_cache_enabled and path.isfile(self.parent.cache_file):
                 print("Cache file is there")
 
                 try:
                     print("Loading cached data")
                     with open(self.parent.cache_file, 'r') as cache_file:
                         cached_data = json.load(cache_file)
+                    if not isinstance(cached_data, dict):
+                        cached_data = {}
                 except Exception as e:
                     cached_data = {}
 
@@ -190,13 +195,30 @@ class FetchDataWorker(QRunnable):
                     #         "Please check if it is empty or corrupted.")
                     print("Failed loading cache file. Please check if it is empty or corrupted.")
 
-            config = configparser.ConfigParser()
+            metadata = cached_data.get('_metadata', {})
+            cache_matches_account = (
+                metadata.get('account_key') == self._cache_account_key()
+            )
             try:
-                config.read(self.parent.user_data_file)
-            except (configparser.Error, UnicodeDecodeError):
-                config = configparser.ConfigParser()
+                cache_age = max(0, time.time() - float(metadata.get('fetched_at', 0)))
+            except (TypeError, ValueError):
+                cache_age = float('inf')
+            required_cache_keys = {
+                key
+                for stream_type in ('LIVE', 'Movies', 'Series')
+                if self.enabled_stream_types[stream_type]
+                for key in (f'{stream_type} categories', stream_type)
+            }
+            cache_is_fresh = (
+                self.catalog_cache_enabled
+                and not self.force_provider_refresh
+                and cache_matches_account
+                and cache_age <= self.catalog_cache_max_age_hours * 3600
+                and required_cache_keys.issubset(cached_data)
+            )
 
-            if config.has_option('Debug', 'load_with_cache') and config['Debug']['load_with_cache'] == 'True':   #For testing purposes only
+            if cache_is_fresh:
+                self.signals.progress_bar.emit(0, 80, "Loading provider catalog from cache")
                 for stream_type in ('LIVE', 'Movies', 'Series'):
                     if not self.enabled_stream_types[stream_type]:
                         continue
@@ -205,6 +227,19 @@ class FetchDataWorker(QRunnable):
                     )
                     entries_per_stream_type[stream_type] = cached_data.get(stream_type, [])
             else:
+                # Account metadata stays out of the catalog cache because provider
+                # responses can contain credentials. The Info tab can refresh it later.
+                self.signals.progress_bar.emit(0, 5, "Fetching IPTV info")
+                try:
+                    iptv_info_resp = requests.get(
+                        host_url, params=params, headers=headers,
+                        timeout=(CONNECTION_TIMEOUT, READ_TIMEOUT)
+                    )
+                    iptv_info_resp.raise_for_status()
+                    iptv_info_data = iptv_info_resp.json()
+                except Exception as e:
+                    print(f"failed fetching IPTV data: {e}")
+
                 # Describe the six provider collections in one table so each content
                 # toggle controls both its category and stream requests consistently.
                 request_plan = (
@@ -215,6 +250,7 @@ class FetchDataWorker(QRunnable):
                     ('Movies', 'streams', 'get_vod_streams', 'Movies', 40, 60),
                     ('Series', 'streams', 'get_series', 'Series', 60, 80),
                 )
+                catalog_fetch_complete = True
 
                 for stream_type, collection, action, cache_key, start, end in request_plan:
                     if not self.enabled_stream_types[stream_type]:
@@ -235,8 +271,12 @@ class FetchDataWorker(QRunnable):
                         response.raise_for_status()
                         result = response.json()
                     except Exception as e:
+                        catalog_fetch_complete = False
                         print(f"Failed fetching {label}: {e}")
-                        result = cached_data.get(cache_key, [])
+                        result = (
+                            cached_data.get(cache_key, [])
+                            if cache_matches_account else []
+                        )
                         if result:
                             print(f"Loaded {label} from cache")
 
@@ -251,7 +291,7 @@ class FetchDataWorker(QRunnable):
 
                 # Preserve cached collections for disabled content. Disabling Movies,
                 # for example, must not erase its useful fallback data from disk.
-                cache_to_write = dict(cached_data)
+                cache_to_write = dict(cached_data) if cache_matches_account else {}
                 for stream_type in ('LIVE', 'Movies', 'Series'):
                     if self.enabled_stream_types[stream_type]:
                         cache_to_write[f'{stream_type} categories'] = (
@@ -259,13 +299,26 @@ class FetchDataWorker(QRunnable):
                         )
                         cache_to_write[stream_type] = entries_per_stream_type[stream_type]
 
-                all_cached_data = json.dumps(cache_to_write, indent=4)
+                if self.catalog_cache_enabled:
+                    cache_to_write['_metadata'] = {
+                        'schema_version': 1,
+                        'account_key': self._cache_account_key(),
+                        # A partial fallback must remain expired so the next launch
+                        # retries the provider instead of trusting incomplete data.
+                        'fetched_at': (
+                            time.time() if catalog_fetch_complete
+                            else metadata.get('fetched_at', 0)
+                        )
+                    }
+                    all_cached_data = json.dumps(cache_to_write, indent=4)
+                    try:
+                        with open(self.parent.cache_file, 'w') as cache_file:
+                            cache_file.write(all_cached_data)
+                    except OSError as error:
+                        # Cache persistence must not discard data already fetched.
+                        print(f"Failed writing provider cache: {error}")
 
-                with open(self.parent.cache_file, 'w') as cache_file:
-                    cache_file.write(all_cached_data)
-
-            # self.set_progress_bar(100, "Finished loading data")
-            self.signals.progress_bar.emit(80, 100, "Finished Fetching data")
+            self.signals.progress_bar.emit(80, 100, "Provider catalog ready")
 
             fav_data = {}
 

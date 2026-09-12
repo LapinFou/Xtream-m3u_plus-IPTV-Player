@@ -38,7 +38,7 @@ from SearchUtils import normalize_search_text, title_matches_search
 import Threadpools
 from Threadpools import FetchDataWorker, SearchWorker, OnlineWorker, EPGWorker, MovieInfoFetcher, SeriesInfoFetcher, ImageFetcher, AccountInfoWorker
 
-CURRENT_VERSION = "V2.01.15"
+CURRENT_VERSION = "V2.01.16"
 REMEMBER_CATEGORY_SORTING = "Remember per category"
 
 DEFAULT_INTERNAL_SEEK_STEP_SECONDS = 10
@@ -185,12 +185,12 @@ def application_palette_is_dark(app):
 
 
 class NetworkSettingsDialog(QDialog):
-    """Edit all network-related preferences without widening the Settings tab."""
+    """Edit advanced provider and network preferences in a compact dialog."""
 
     def __init__(self, parent):
         super().__init__(parent)
         self.parent_app = parent
-        self.setWindowTitle("Advanced network settings")
+        self.setWindowTitle("Advanced settings")
         self.setModal(True)
 
         main_layout = QVBoxLayout(self)
@@ -241,6 +241,32 @@ class NetworkSettingsDialog(QDialog):
         general_form.addRow(self.account_refresh_checkbox)
         general_form.addRow("Info auto-refresh interval:", self.account_refresh_spin)
 
+        cache_group = QGroupBox("Provider catalog cache")
+        cache_form = QFormLayout(cache_group)
+        self.catalog_cache_checkbox = QCheckBox("Use cached provider catalogs")
+        self.catalog_cache_checkbox.setChecked(parent.catalog_cache_enabled)
+        self.catalog_cache_checkbox.setToolTip(
+            "Reuse LIVE, Movies, and Series data until the cache expires"
+        )
+        self.catalog_cache_hours_spin = QSpinBox()
+        self.catalog_cache_hours_spin.setRange(1, 720)
+        self.catalog_cache_hours_spin.setSuffix(" h")
+        self.catalog_cache_hours_spin.setValue(parent.catalog_cache_max_age_hours)
+        self.catalog_cache_hours_spin.setToolTip(
+            "Fetch fresh provider catalogs on the next account load after this age"
+        )
+        self.catalog_cache_checkbox.toggled.connect(
+            self.catalog_cache_hours_spin.setEnabled
+        )
+        self.catalog_cache_hours_spin.setEnabled(
+            self.catalog_cache_checkbox.isChecked()
+        )
+        self.refresh_catalog_button = QPushButton("Refresh provider catalog now")
+        self.refresh_catalog_button.clicked.connect(self.refresh_catalog_now)
+        cache_form.addRow(self.catalog_cache_checkbox)
+        cache_form.addRow("Refresh after:", self.catalog_cache_hours_spin)
+        cache_form.addRow(self.refresh_catalog_button)
+
         live_group = QGroupBox("LIVE stream status")
         live_layout = QVBoxLayout(live_group)
         self.live_status_checkbox = QCheckBox("Enable LIVE stream status checks")
@@ -284,6 +310,7 @@ class NetworkSettingsDialog(QDialog):
         )
 
         main_layout.addWidget(general_group)
+        main_layout.addWidget(cache_group)
         main_layout.addWidget(live_group)
         main_layout.addWidget(self.button_box)
 
@@ -314,8 +341,12 @@ class NetworkSettingsDialog(QDialog):
             Threadpools.DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL
         )
         self.account_refresh_checkbox.setChecked(True)
+        self.catalog_cache_checkbox.setChecked(True)
+        self.catalog_cache_hours_spin.setValue(
+            Threadpools.DEFAULT_CATALOG_CACHE_MAX_AGE_HOURS
+        )
 
-    def save_settings(self):
+    def save_settings(self, force_catalog_refresh=False):
         """Apply the complete dialog state as one coherent configuration update."""
         self.parent_app.applyNetworkSettings(
             self.user_agent_box.currentText(),
@@ -325,9 +356,17 @@ class NetworkSettingsDialog(QDialog):
             self.live_retries_spin.value(),
             self.live_status_checkbox.isChecked(),
             self.account_refresh_spin.value(),
-            self.account_refresh_checkbox.isChecked()
+            self.account_refresh_checkbox.isChecked(),
+            self.catalog_cache_checkbox.isChecked(),
+            self.catalog_cache_hours_spin.value()
         )
+        if force_catalog_refresh:
+            self.parent_app.refreshProviderCatalog()
         self.accept()
+
+    def refresh_catalog_now(self):
+        """Save current settings and explicitly bypass the catalog cache once."""
+        self.save_settings(force_catalog_refresh=True)
 
 
 class CategoryVisibilityDialog(QDialog):
@@ -665,6 +704,10 @@ class IPTVPlayerApp(QMainWindow):
             Threadpools.DEFAULT_ACCOUNT_INFO_REFRESH_INTERVAL
         )
         self.account_info_auto_refresh_enabled = True
+        self.catalog_cache_enabled = True
+        self.catalog_cache_max_age_hours = (
+            Threadpools.DEFAULT_CATALOG_CACHE_MAX_AGE_HOURS
+        )
         self.account_info_refresh_in_progress = False
         self.account_info_worker = None
         self.account_info_threadpool = QThreadPool()
@@ -2183,7 +2226,11 @@ class IPTVPlayerApp(QMainWindow):
         self.external_player_radio.toggled.connect(self.use_external_player)
 
         self.player_group_layout.addWidget(self.internal_player_radio, 0, 0)
-        self.player_group_layout.addWidget(self.internal_player_settings_button, 0, 2)
+        # Align the internal options with the complete path-and-Browse area used
+        # by the external player row directly below it.
+        self.player_group_layout.addWidget(
+            self.internal_player_settings_button, 0, 1, 1, 2
+        )
         self.player_group_layout.addWidget(self.external_player_radio, 1, 0)
         self.player_group_layout.addWidget(self.external_player_path, 1, 1)
         self.player_group_layout.addWidget(self.choose_player_button, 1, 2)
@@ -2216,14 +2263,6 @@ class IPTVPlayerApp(QMainWindow):
         ])
         self.default_sorting_order_box.currentTextChanged.connect(lambda e: self.setDefaultSortingOrder(e, self.default_sorting_order_box))
 
-        # self.cache_on_startup_checkbox = QCheckBox("Startup with cached data")
-        # self.cache_on_startup_checkbox.setToolTip("Loads the cached IPTV data on startup to reduce startup time.\nNote that the cached data only changes if you manually reload it once in a while.")
-        # self.cache_on_startup_checkbox.stateChanged.connect(self.toggle_cache_on_startup)
-
-        # self.reload_data_btn = QPushButton("Reload data")
-        # self.reload_data_btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload))
-        # self.reload_data_btn.setToolTip("Click this to manually reload the IPTV data.\nNote that this only has effect if \'Startup with cached data\' is checked.")
-
         self.update_checker = QPushButton("Check for updates")
         self.update_checker.clicked.connect(lambda: self.checkForUpdates(True))
 
@@ -2231,7 +2270,7 @@ class IPTVPlayerApp(QMainWindow):
         self.auto_update_checkbox.setToolTip("Automatically check for updates at startup")
         self.auto_update_checkbox.stateChanged.connect(self.toggleAutoUpdate)
 
-        self.advanced_network_button = QPushButton("Advanced network settings…")
+        self.advanced_network_button = QPushButton("Advanced settings…")
         self.advanced_network_button.setToolTip(
             "Configure request timeouts, Info refresh, LIVE status checks, retries, and User-Agent"
         )
@@ -2242,21 +2281,38 @@ class IPTVPlayerApp(QMainWindow):
         self.theme_select_box.setToolTip("Switch between Light, Dark, or follow the OS setting (default).")
         self.theme_select_box.currentTextChanged.connect(self.themeChanged)
 
-        #Add widgets to settings tab layout
-        self.settings_layout.addWidget(self.address_book_button,                            0, 0, 1, 2)
-        self.settings_layout.addWidget(self.player_group_box,                               1, 0, 1, 2)
-        self.settings_layout.addWidget(self.content_group_box,                              2, 0, 1, 2)
-        self.settings_layout.addWidget(self.keep_on_top_checkbox,                           3, 0)
-        self.settings_layout.addWidget(QLabel("Default sorting order: "),                   4, 0)
-        self.settings_layout.addWidget(self.default_sorting_order_box,                      4, 1)
-        self.settings_layout.addWidget(self.update_checker,                                 5, 0)
-        self.settings_layout.addWidget(self.auto_update_checkbox,                           5, 1)
-        self.settings_layout.addWidget(self.advanced_network_button,                        6, 0, 1, 2)
-        self.settings_layout.addWidget(QLabel("Theme: "),                                  7, 0)
-        self.settings_layout.addWidget(self.theme_select_box,                               7, 1)
+        # Group the remaining preferences consistently with Media player and Content.
+        self.window_behavior_group_box = QGroupBox("Window behavior")
+        window_behavior_layout = QHBoxLayout(self.window_behavior_group_box)
+        window_behavior_layout.addWidget(self.keep_on_top_checkbox)
+        window_behavior_layout.addSpacing(30)
+        window_behavior_layout.addWidget(QLabel("Theme:"))
+        window_behavior_layout.addWidget(self.theme_select_box, 1)
 
-        # self.settings_layout.addWidget(self.cache_on_startup_checkbox,  2, 0)
-        # self.settings_layout.addWidget(self.reload_data_btn,            3, 0)
+        self.sorting_group_box = QGroupBox("Sorting")
+        sorting_layout = QHBoxLayout(self.sorting_group_box)
+        sorting_layout.addWidget(QLabel("Default sorting order:"))
+        sorting_layout.addWidget(self.default_sorting_order_box, 1)
+
+        self.advanced_settings_group_box = QGroupBox("Advanced settings")
+        advanced_settings_layout = QHBoxLayout(self.advanced_settings_group_box)
+        self.advanced_network_button.setText("Open advanced settings…")
+        advanced_settings_layout.addWidget(self.advanced_network_button)
+
+        self.updates_group_box = QGroupBox("Updates")
+        updates_layout = QHBoxLayout(self.updates_group_box)
+        updates_layout.addWidget(self.update_checker)
+        updates_layout.addWidget(self.auto_update_checkbox)
+        updates_layout.addStretch()
+
+        # Keep the Settings page in the exact functional order shown to the user.
+        self.settings_layout.addWidget(self.address_book_button,             0, 0, 1, 2)
+        self.settings_layout.addWidget(self.content_group_box,               1, 0, 1, 2)
+        self.settings_layout.addWidget(self.window_behavior_group_box,       2, 0, 1, 2)
+        self.settings_layout.addWidget(self.sorting_group_box,               3, 0, 1, 2)
+        self.settings_layout.addWidget(self.player_group_box,                4, 0, 1, 2)
+        self.settings_layout.addWidget(self.advanced_settings_group_box,     5, 0, 1, 2)
+        self.settings_layout.addWidget(self.updates_group_box,               6, 0, 1, 2)
 
     def loadDefaultUserAgent(self):
         #Read userdata config file
@@ -2419,8 +2475,9 @@ class IPTVPlayerApp(QMainWindow):
     def applyNetworkSettings(self, user_agent, connection_timeout, read_timeout,
                              live_status_timeout, live_status_retries,
                              stream_status_enabled, account_refresh_interval,
-                             account_auto_refresh_enabled):
-        """Apply and persist all advanced network settings in one operation."""
+                             account_auto_refresh_enabled, catalog_cache_enabled,
+                             catalog_cache_max_age_hours):
+        """Apply and persist all advanced provider settings in one operation."""
         self.current_user_agent = user_agent or Threadpools.DEFAULT_USER_AGENT_HEADER
         Threadpools.CONNECTION_TIMEOUT = connection_timeout
         Threadpools.READ_TIMEOUT = read_timeout
@@ -2429,6 +2486,8 @@ class IPTVPlayerApp(QMainWindow):
         self.stream_status_enabled = stream_status_enabled
         self.account_info_refresh_interval = account_refresh_interval
         self.account_info_auto_refresh_enabled = account_auto_refresh_enabled
+        self.catalog_cache_enabled = catalog_cache_enabled
+        self.catalog_cache_max_age_hours = catalog_cache_max_age_hours
         self._applyStreamStatusVisibility()
         self._updateAccountInfoTimer()
 
@@ -2449,6 +2508,10 @@ class IPTVPlayerApp(QMainWindow):
         config['AccountInfo'] = {
             'refresh_interval': str(account_refresh_interval),
             'auto_refresh_enabled': str(account_auto_refresh_enabled)
+        }
+        config['CatalogCache'] = {
+            'enabled': str(catalog_cache_enabled),
+            'max_age_hours': str(catalog_cache_max_age_hours)
         }
 
         try:
@@ -2512,6 +2575,25 @@ class IPTVPlayerApp(QMainWindow):
             except (ValueError, configparser.Error):
                 self.account_info_auto_refresh_enabled = True
             self._updateAccountInfoTimer()
+
+            try:
+                self.catalog_cache_enabled = config.getboolean(
+                    'CatalogCache', 'enabled', fallback=True
+                )
+            except (ValueError, configparser.Error):
+                self.catalog_cache_enabled = True
+            try:
+                self.catalog_cache_max_age_hours = config.getint(
+                    'CatalogCache', 'max_age_hours',
+                    fallback=Threadpools.DEFAULT_CATALOG_CACHE_MAX_AGE_HOURS
+                )
+            except (ValueError, configparser.Error):
+                self.catalog_cache_max_age_hours = (
+                    Threadpools.DEFAULT_CATALOG_CACHE_MAX_AGE_HOURS
+                )
+            self.catalog_cache_max_age_hours = max(
+                1, min(self.catalog_cache_max_age_hours, 720)
+            )
 
         except Exception as e:
             print(f"Failed loading default timeout values: {e}")
@@ -2661,11 +2743,12 @@ class IPTVPlayerApp(QMainWindow):
         #Apply persisted theme (Light / Dark / System) — default System
         self.loadDefaultTheme()
 
+        # Load network and cache preferences before startup credentials can begin
+        # provider requests in the background.
+        self.loadDefaultNetworkOptions()
+
         #Load startup credentials
         self.loadStartupCredentials()
-
-        # Load the default and persisted network timeouts/retry count.
-        self.loadDefaultNetworkOptions()
 
     def loadStartupCredentials(self):
         # Load playlist on startup if enabled. A malformed/missing key here used to crash
@@ -3022,7 +3105,7 @@ class IPTVPlayerApp(QMainWindow):
 
         self.set_progress_bar(0, "Going to fetch data...")
 
-    def fetch_data_thread(self):
+    def fetch_data_thread(self, force_refresh=False):
         dataWorker = FetchDataWorker(
             self.server,
             self.username,
@@ -3031,7 +3114,10 @@ class IPTVPlayerApp(QMainWindow):
             self.movie_url_format,
             self.series_url_format,
             self,
-            self.content_enabled
+            self.content_enabled,
+            self.catalog_cache_enabled,
+            self.catalog_cache_max_age_hours,
+            force_refresh
         )
         dataWorker.signals.finished.connect(self.process_data)
         dataWorker.signals.error.connect(self.on_fetch_data_error)
@@ -3039,6 +3125,14 @@ class IPTVPlayerApp(QMainWindow):
         dataWorker.signals.show_error_msg.connect(self.show_error_msg)
         dataWorker.signals.show_info_msg.connect(self.show_info_msg)
         self.threadpool.start(dataWorker)
+
+    def refreshProviderCatalog(self):
+        """Fetch every enabled provider collection while retaining cache fallback."""
+        if not self.server or not self.username or not self.password:
+            self.show_info_msg("No account selected", "Select an IPTV account first.")
+            return
+        self.set_progress_bar(0, "Refreshing provider catalog...")
+        self.fetch_data_thread(force_refresh=True)
 
     def _isInfoTabVisible(self):
         """Return whether Info is the currently selected visible tab."""
@@ -3163,8 +3257,10 @@ class IPTVPlayerApp(QMainWindow):
 
         self.set_progress_bar(0, "Processing received data...")
 
-        #Process IPTV info
-        self.updateAccountInfo(iptv_info)
+        # A cache hit deliberately skips the account request. Keep the initial Info
+        # state until that tab performs its existing lightweight refresh.
+        if iptv_info:
+            self.updateAccountInfo(iptv_info)
 
         #Process categories and entries
         hidden_categories_changed = False
