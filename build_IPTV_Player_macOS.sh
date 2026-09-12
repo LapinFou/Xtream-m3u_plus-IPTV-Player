@@ -39,12 +39,6 @@ if [ ! -d "/Applications/VLC.app" ]; then
   echo "Install the latest VLC from https://www.videolan.org/vlc/ before using the internal player."
 fi
 
-# A macOS bundle needs an ICNS icon. Build without a custom icon when none exists.
-ICON_ARGS=()
-if [ -f "Images/TV_icon.icns" ]; then
-  ICON_ARGS=(--icon "Images/TV_icon.icns")
-fi
-
 # Remove outputs from an earlier build only after dependency checks succeed.
 if [ -d "$BUILD_PATH" ]; then
   echo "Removing old build folder: $BUILD_PATH"
@@ -54,6 +48,12 @@ fi
 if [ -d "$DIST_PATH" ]; then
   echo "Removing old dist folder: $DIST_PATH"
   rm -rf "$DIST_PATH"
+fi
+
+# Use the native macOS icon stored with the other application artwork.
+ICON_ARGS=()
+if [ -f "Images/TV_icon.icns" ]; then
+  ICON_ARGS=(--icon "Images/TV_icon.icns")
 fi
 
 # Keep the packaged files visible inside the macOS application bundle. This

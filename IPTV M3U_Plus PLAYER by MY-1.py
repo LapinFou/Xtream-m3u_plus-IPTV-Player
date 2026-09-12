@@ -66,6 +66,15 @@ is_linux    = sys.platform.startswith('linux')
 GITHUB_REPO = "Youri666/Xtream-m3u_plus-IPTV-Player"
 
 
+def writable_data_directory():
+    """Return the directory used for configuration and disposable user data."""
+    if is_mac:
+        # A signed or Finder-launched .app must not rely on its bundle directory
+        # being writable. Application Support is the standard persistent location.
+        return path.join(path.expanduser("~"), "Library", "Application Support", "IPTV Player")
+    return path.abspath(".")
+
+
 def private_url_log_reference(url):
     """Identify a stream in logs without exposing its host or credentials."""
     try:
@@ -513,9 +522,11 @@ class IPTVPlayerApp(QMainWindow):
         ]
         self.current_user_agent = ""
 
-        self.user_data_file = "userdata.ini"
-        self.favorites_file = "favorites.json"
-        self.cache_file     = "all_cached_data.json"
+        self.data_directory = writable_data_directory()
+        os.makedirs(self.data_directory, exist_ok=True)
+        self.user_data_file = path.join(self.data_directory, "userdata.ini")
+        self.favorites_file = path.join(self.data_directory, "favorites.json")
+        self.cache_file = path.join(self.data_directory, "all_cached_data.json")
 
         # The internal VLC UI runs in a second process. Commands are queued so
         # sending a large visible playlist can never block the main Qt event loop.

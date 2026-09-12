@@ -227,4 +227,12 @@ python3 -m pip install --upgrade requests lxml python-dateutil PyQt5
 - Run [./build_IPTV_Player_macOS.sh](build_IPTV_Player_macOS.sh).
 - The generated application is written to `dist/IPTV_Player.app`.
 
+### 4. Install the application
+- Open the `dist` folder in Finder.
+- Drag `IPTV_Player.app` into the macOS `Applications` folder.
+- Only the `.app` bundle is required. The neighboring `IPTV_Player` folder is a
+  PyInstaller build output and does not need to be copied.
+- On first launch, macOS may require Control-clicking the application and choosing
+  **Open** because the application is not code-signed.
+
 </details>
