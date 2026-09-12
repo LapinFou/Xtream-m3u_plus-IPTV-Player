@@ -512,7 +512,7 @@ class EmbeddedPlayerWindow(QMainWindow):
     """
 
     def __init__(
-        self, parent=None, user_agent="", volume_pref_path=None,
+        self, parent=None, user_agent="", settings_path=None,
         seek_step_seconds=10, volume_step_percent=2, speed_step=0.25,
         audio_language="", subtitle_language=""
     ):
@@ -547,7 +547,7 @@ class EmbeddedPlayerWindow(QMainWindow):
         self._audio_language = ""
         self._subtitle_language = ""
         self._app_parent = parent
-        self._explicit_volume_pref_path = volume_pref_path
+        self._explicit_settings_path = settings_path
         self._volume = self._load_volume_pref()
         self._volume_before_mute = self._volume if self._volume > 0 else 80
         self.player.audio_set_volume(self._volume)
@@ -1499,33 +1499,38 @@ class EmbeddedPlayerWindow(QMainWindow):
         return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
     # ---------- volume persistence ----------
-    def _volume_pref_path(self):
-        if self._explicit_volume_pref_path:
-            return self._explicit_volume_pref_path
+    def _settings_path(self):
+        if self._explicit_settings_path:
+            return self._explicit_settings_path
         try:
-            return path.join(path.dirname(path.abspath(self._app_parent.user_data_file)),
-                             ".embedded_player_volume")
+            return path.abspath(self._app_parent.user_data_file)
         except Exception:
             return None
 
     def _load_volume_pref(self):
-        p = self._volume_pref_path()
-        if not p or not path.isfile(p):
+        settings_path = self._settings_path()
+        if not settings_path or not path.isfile(settings_path):
             return 80
         try:
-            with open(p, "r") as f:
-                return max(0, min(100, int(f.read().strip())))
-        except (OSError, ValueError):
+            config = configparser.ConfigParser()
+            config.read(settings_path)
+            return max(0, min(100, config.getint("InternalPlayer", "volume", fallback=80)))
+        except (OSError, ValueError, configparser.Error, UnicodeDecodeError):
             return 80
 
     def _save_volume_pref(self):
-        p = self._volume_pref_path()
-        if not p:
+        settings_path = self._settings_path()
+        if not settings_path:
             return
         try:
-            with open(p, "w") as f:
-                f.write(str(self._volume))
-        except OSError:
+            config = configparser.ConfigParser()
+            config.read(settings_path)
+            if not config.has_section("InternalPlayer"):
+                config.add_section("InternalPlayer")
+            config.set("InternalPlayer", "volume", str(self._volume))
+            with open(settings_path, "w") as settings_file:
+                config.write(settings_file)
+        except (OSError, configparser.Error, UnicodeDecodeError):
             pass
 
     # ---------- events ----------

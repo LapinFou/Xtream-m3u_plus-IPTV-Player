@@ -566,6 +566,7 @@ class IPTVPlayerApp(QMainWindow):
 
         # Update the .ini file if needed to maintain backward compatibility.
         self.updateUserDataFile()
+        self._migrateLegacyPlayerVolume()
 
         self.path_to_window_icon            = path.abspath(path.join(path.dirname(__file__), 'Images/TV_icon.ico'))
         self.path_to_no_img                 = path.abspath(path.join(path.dirname(__file__), 'Images/no_image.jpg'))
@@ -1101,6 +1102,27 @@ class IPTVPlayerApp(QMainWindow):
                 config.write(config_file)
         except OSError as e:
             print(f"Could not persist user data file: {e}")
+
+    def _migrateLegacyPlayerVolume(self):
+        """Move the former standalone volume preference into userdata.ini."""
+        legacy_path = path.join(self.data_directory, ".embedded_player_volume")
+        if not path.isfile(legacy_path):
+            return
+
+        config = configparser.ConfigParser()
+        try:
+            config.read(self.user_data_file)
+            if not config.has_option("InternalPlayer", "volume"):
+                with open(legacy_path, "r") as legacy_file:
+                    volume = max(0, min(100, int(legacy_file.read().strip())))
+                if not config.has_section("InternalPlayer"):
+                    config.add_section("InternalPlayer")
+                config.set("InternalPlayer", "volume", str(volume))
+                with open(self.user_data_file, "w") as config_file:
+                    config.write(config_file)
+            os.remove(legacy_path)
+        except (OSError, ValueError, configparser.Error, UnicodeDecodeError) as error:
+            print(f"Could not migrate the legacy player volume: {error}")
 
     def initIcons(self):
         #Set tab icon size to 24x24
@@ -2441,12 +2463,15 @@ class IPTVPlayerApp(QMainWindow):
             config.read(self.user_data_file)
         except (configparser.Error, UnicodeDecodeError):
             config = configparser.ConfigParser()
+        # Preserve the volume written by the isolated player process.
+        saved_volume = config.get('InternalPlayer', 'volume', fallback='80')
         config['InternalPlayer'] = {
             'seek_step_seconds': str(self.internal_seek_step_seconds),
             'volume_step_percent': str(self.internal_volume_step_percent),
             'speed_step': str(self.internal_speed_step),
             'audio_language': self.internal_audio_language,
-            'subtitle_language': self.internal_subtitle_language
+            'subtitle_language': self.internal_subtitle_language,
+            'volume': saved_volume
         }
         try:
             with open(self.user_data_file, 'w') as config_file:
@@ -4608,9 +4633,7 @@ class IPTVPlayerApp(QMainWindow):
         environment['IPTV_PLAYER_SPEED_STEP'] = str(self.internal_speed_step)
         environment['IPTV_PLAYER_AUDIO_LANGUAGE'] = self.internal_audio_language
         environment['IPTV_PLAYER_SUBTITLE_LANGUAGE'] = self.internal_subtitle_language
-        environment['IPTV_PLAYER_VOLUME_FILE'] = path.abspath(
-            path.join(path.dirname(self.user_data_file), '.embedded_player_volume')
-        )
+        environment['IPTV_PLAYER_SETTINGS_FILE'] = path.abspath(self.user_data_file)
 
         if getattr(sys, 'frozen', False):
             # Tell recent PyInstaller bootloaders that this is a new application
@@ -5136,7 +5159,7 @@ def _run_embedded_player_process():
     player = EmbeddedPlayerWindow(
         None,
         user_agent=os.environ.get('IPTV_PLAYER_USER_AGENT', ''),
-        volume_pref_path=os.environ.get('IPTV_PLAYER_VOLUME_FILE') or None,
+        settings_path=os.environ.get('IPTV_PLAYER_SETTINGS_FILE') or None,
         seek_step_seconds=seek_step,
         volume_step_percent=volume_step,
         speed_step=speed_step,

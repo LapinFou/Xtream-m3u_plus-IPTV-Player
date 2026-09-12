@@ -80,7 +80,7 @@ fi
   --noconfirm \
   --hidden-import vlc \
   "${ICON_ARGS[@]}" \
-  --name "IPTV_Player" \
+  --name "IPTV Player" \
   --distpath "$DIST_PATH" \
   --workpath "$BUILD_PATH" \
   --add-data "Images/TV_icon.ico:Images" \
@@ -114,12 +114,17 @@ fi
 
 # The .app bundle contains its own complete copy. Keep only the artifact users
 # install, after confirming that PyInstaller created it successfully.
-if [ -d "$DIST_PATH/IPTV_Player.app" ] && [ -d "$DIST_PATH/IPTV_Player" ]; then
-  rm -rf "$DIST_PATH/IPTV_Player"
+if [ ! -d "$DIST_PATH/IPTV Player.app" ]; then
+  echo "ERROR: The macOS application bundle was not created."
+  exit 1
+fi
+if [ -d "$DIST_PATH/IPTV Player" ]; then
+  echo "Removing duplicate PyInstaller folder: $DIST_PATH/IPTV Player"
+  rm -rf "$DIST_PATH/IPTV Player"
 fi
 
 echo
-echo "Build completed: $DIST_PATH/IPTV_Player.app"
-echo "Launch with: open '$DIST_PATH/IPTV_Player.app'"
+echo "Build completed: $DIST_PATH/IPTV Player.app"
+echo "Launch with: open '$DIST_PATH/IPTV Player.app'"
 echo "If Finder shows no error, diagnose with:"
-echo "'$DIST_PATH/IPTV_Player.app/Contents/MacOS/IPTV_Player'"
+echo "'$DIST_PATH/IPTV Player.app/Contents/MacOS/IPTV Player'"
