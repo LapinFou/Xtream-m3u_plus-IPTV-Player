@@ -127,7 +127,8 @@ fi
 
 # Create a compressed disk image suitable for a GitHub release. The Applications
 # shortcut lets users install the app with the usual drag-and-drop gesture.
-APP_VERSION=$(sed -n 's/^CURRENT_VERSION = "\([^"]*\)"/\1/p' "$MAIN_SCRIPT" | head -n 1)
+# Strip Windows carriage returns because the source file may use CRLF endings.
+APP_VERSION=$(sed -n 's/^CURRENT_VERSION = "\([^"]*\)"/\1/p' "$MAIN_SCRIPT" | head -n 1 | tr -d '\r')
 if [ -z "$APP_VERSION" ]; then
   echo "ERROR: Could not read CURRENT_VERSION from $MAIN_SCRIPT."
   exit 1
